@@ -1,0 +1,2 @@
+# Install a PyTorch build suitable for your GPU first; see https://pytorch.org/get-started/locally/
+spandrel>=0.4,<0.5

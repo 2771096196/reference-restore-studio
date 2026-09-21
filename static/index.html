@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>原图回贴 · 视频局部修复</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23202b30'/%3E%3Cpath d='m14 27 18-10 18 10-18 10Z' fill='%23edbb76'/%3E%3Cpath d='m14 38 18 10 18-10' fill='none' stroke='%23edbb76' stroke-width='5'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <header class="menubar">
+      <div class="logo">
+        <span class="app-icon">▱</span><strong>原图回贴</strong>
+      </div>
+      <nav class="menu-actions">
+        <button id="import-button">文件 · 导入</button
+        ><button id="undo-button" disabled>撤销</button
+        ><button id="sample-button">示例素材</button
+        ><button id="help-button">帮助</button>
+      </nav>
+      <button
+        class="top-status"
+        id="top-export-state"
+        hidden
+        title="查看导出进度"
+      >
+        <span class="spinner"></span
+        ><span id="top-export-detail"></span></button
+      ><button class="button danger" id="top-cancel-export" hidden>
+        终止导出</button
+      ><button class="button primary" id="export-button" disabled>
+        导出 MP4 ↗
+      </button>
+    </header>
+    <div class="options-bar" aria-label="画笔选项">
+      <span class="option-tool" id="current-tool-label">画笔 · 擦回原图</span>
+      <div class="brush-option">
+        <label for="brush-size"
+          >大小 <output id="brush-size-out">48 px</output></label
+        ><input
+          id="brush-size"
+          type="range"
+          min="6"
+          max="250"
+          step="1"
+          value="48"
+        />
+      </div>
+      <div class="brush-option">
+        <label for="brush-hardness"
+          >硬度 <output id="brush-hardness-out">50%</output></label
+        ><input id="brush-hardness" type="range" min="0" max="100" value="50" />
+      </div>
+      <span class="option-divider"></span>
+      <div class="brush-option">
+        <label for="brush-opacity"
+          >不透明度 <output id="brush-opacity-out">100%</output></label
+        ><input id="brush-opacity" type="range" min="0" max="100" value="100" />
+      </div>
+      <div class="brush-option">
+        <label for="brush-flow"
+          >流量 <output id="brush-flow-out">100%</output></label
+        ><input id="brush-flow" type="range" min="1" max="100" value="100" />
+      </div>
+      <span
+        class="option-hint"
+        title="不透明度控制单笔上限；流量控制经过时的累积速度。"
+        >单笔上限 ≠ 累积速度</span
+      >
+    </div>
+    <div class="editor">
+      <aside class="toolbox" aria-label="工具栏">
+        <button
+          data-tool="restore"
+          class="selected"
+          title="画笔：擦回原图（B）"
+          aria-label="画笔：擦回原图"
+        >
+          <svg viewBox="0 0 24 24">
+            <path
+              d="m8 14 9-10 3 3-10 9M8 14l2 2c0 4-3 5-6 4 2-1 0-5 4-6Z"
+            /></svg
+          ><small>B</small></button
+        ><button
+          data-tool="protect"
+          title="黑笔：保留视频（E）"
+          aria-label="黑笔：保留视频"
+        >
+          <svg viewBox="0 0 24 24">
+            <path d="m4 14 10-10 7 7-10 10H8Zm6 6 5-5-7-7M13 21h9" /></svg
+          ><small>E</small></button
+        ><button
+          data-tool="auto"
+          title="清除手绘，恢复自动蒙版"
+          aria-label="恢复自动蒙版"
+        >
+          <svg viewBox="0 0 24 24"><path d="M5 8a8 8 0 1 1-1 8M5 3v5h5" /></svg
+          ><small>A</small>
+        </button>
+        <div class="tool-divider"></div>
+        <button
+          id="face-button"
+          title="框选刚性回贴区域（脸部）"
+          aria-label="框选脸部"
+        >
+          <svg viewBox="0 0 24 24">
+            <path d="M4 8V4h4m8 0h4v4m0 8v4h-4M8 20H4v-4" />
+            <ellipse cx="12" cy="12" rx="5" ry="7" />
+          </svg></button
+        ><button
+          id="hand-tool"
+          title="抓手（H / 按住空格）"
+          aria-label="抓手平移"
+        >
+          <svg viewBox="0 0 24 24">
+            <path
+              d="M7 12V6a1.5 1.5 0 0 1 3 0v5-7a1.5 1.5 0 0 1 3 0v7-6a1.5 1.5 0 0 1 3 0v7-4a1.5 1.5 0 0 1 3 0v6c0 4-2 7-6 7H11c-2 0-3-2-4-3l-4-5c-1-2 1-3 2-2l2 2Z"
+            /></svg
+          ><small>H</small></button
+        ><button
+          id="zoom-tool"
+          title="缩放（Z / Alt 点击缩小）"
+          aria-label="缩放工具"
+        >
+          <svg viewBox="0 0 24 24">
+            <circle cx="10" cy="10" r="6" />
+            <path d="m15 15 6 6M7 10h6M10 7v6" /></svg
+          ><small>Z</small>
+        </button>
+        <div class="tool-divider"></div>
+        <button
+          id="swap-brush"
+          class="color-swatches"
+          title="交换黑白（X）"
+          aria-label="交换黑白笔"
+        >
+          <span class="foreground"></span
+          ><span class="background"></span></button
+        ><span class="toolbox-note">X</span>
+      </aside>
+      <main class="document">
+        <div class="document-tab">
+          <span class="doc-icon">▧</span><span id="image-name">未载入素材</span
+          ><span class="doc-sep">/</span><span id="video-name"></span
+          ><span id="edit-target-label">修复蒙版</span>
+        </div>
+        <div class="viewer-top">
+          <div class="view-tabs" role="group" aria-label="预览模式">
+            <button data-view="composite" class="selected">合成</button
+            ><button data-view="video">视频</button
+            ><button data-view="aligned">对齐原图</button
+            ><button data-view="mask">蒙版</button
+            ><button data-view="overlay">覆盖区域</button
+            ><button data-view="reference">原图画布</button>
+          </div>
+          <div class="preview-controls">
+            <label
+              >预览
+              <select id="preview-resolution" aria-label="预览分辨率">
+                <option value="eighth">1/8 · 最流畅</option>
+                <option value="quarter">1/4 · 流畅</option>
+                <option value="half" selected>1/2 · 均衡</option>
+                <option value="video">视频原尺寸</option>
+                <option value="double">2倍尺寸</option>
+                <option value="original">原图尺寸</option>
+              </select></label
+            ><span id="preview-label"></span>
+          </div>
+        </div>
+        <div id="viewport">
+          <div id="surface">
+            <img id="frame-image" alt="视频修复预览" draggable="false" /><canvas
+              id="paint-canvas"
+              tabindex="0"
+              aria-label="在画面上涂抹修复蒙版"
+            ></canvas
+            ><canvas id="cursor-canvas" aria-hidden="true"></canvas>
+            <div id="empty-stage">
+              <span>▱</span>
+              <h1>擦回原图的细节</h1>
+              <p>原图与视频自动对齐后，用黑白蒙版决定保留哪里。</p>
+              <button class="button primary" id="empty-import">
+                导入原图与视频
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="viewer-bottom">
+          <span id="tool-hint">等待素材</span>
+          <div class="zoom-tools">
+            <button id="zoom-out" title="Ctrl+-">−</button
+            ><span id="zoom-value">适应</span
+            ><button id="zoom-in" title="Ctrl++">＋</button
+            ><button id="zoom-fit" title="Ctrl+0">适应</button
+            ><button id="zoom-actual" title="Ctrl+1 · 当前预览像素">
+              100%
+            </button>
+          </div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-heading">
+            <strong>时间轴</strong><span id="project-info">本地工程</span>
+          </div>
+          <div class="transport">
+            <button id="previous-frame" title="上一帧">❮</button
+            ><button id="play-button" aria-label="播放修复预览">▶</button
+            ><button id="next-frame" title="下一帧">❯</button
+            ><span id="timecode">00:00.00</span
+            ><input
+              id="scrubber"
+              aria-label="视频时间线"
+              type="range"
+              min="0"
+              max="0"
+              value="0"
+              step="1"
+            /><span id="frame-counter">0 / 0 帧</span>
+          </div>
+          <div class="timeline-ticks">
+            <span>预览尺寸独立于导出，AI 超分效果见成片</span
+            ><span id="timeline-end"></span>
+          </div>
+        </div>
+      </main>
+      <aside class="right panels">
+        <section class="layers-panel">
+          <div class="panel-title">
+            <strong>图层</strong><span>两层 · 蒙版编辑</span>
+          </div>
+          <div class="layer-settings">
+            <span class="blend-mode">正常</span
+            ><label for="strength"
+              >图层不透明度 <output id="strength-out">100%</output></label
+            ><input id="strength" type="range" min="0" max="100" value="100" />
+          </div>
+          <div class="layer-row selected" id="repair-layer-row">
+            <label class="eye-toggle" title="显示 / 隐藏原图修复层"
+              ><input
+                id="layer-enabled"
+                type="checkbox"
+                checked
+                aria-label="显示原图修复层"
+              /><span>◉</span></label
+            ><button
+              class="thumbnail"
+              id="select-image"
+              title="查看原图内容（只读）"
+              aria-label="原图内容缩略图"
+            >
+              <img id="thumb-reference" alt="原图缩略图" /></button
+            ><span class="link-mark" title="原图与蒙版跟随对齐">↔</span
+            ><button
+              class="thumbnail mask selected"
+              id="select-mask"
+              title="编辑修复蒙版"
+              aria-label="修复蒙版缩略图"
+            >
+              <img id="thumb-mask" alt="黑白蒙版缩略图" />
+            </button>
+            <div class="layer-name">
+              <strong>原图修复层</strong
+              ><small id="mask-selected-label">蒙版已选中</small>
+            </div>
+          </div>
+          <div class="layer-row" id="video-layer-row">
+            <span class="base-eye">◉</span
+            ><button
+              class="thumbnail"
+              id="select-video"
+              title="查看底层视频（只读）"
+              aria-label="视频图层缩略图"
+            >
+              <img id="thumb-video" alt="当前视频帧缩略图" />
+            </button>
+            <div class="layer-name">
+              <strong>生成视频</strong><small>原运动与音轨</small>
+            </div>
+            <span class="locked" title="底层只读">▣</span>
+          </div>
+          <div class="layer-footer">
+            <span>白：原图　黑：视频</span
+            ><button id="download-mask" title="下载当前帧蒙版">蒙版 ↓</button
+            ><button id="clear-button" title="清除手绘，可撤销">
+              清除手绘
+            </button>
+          </div>
+        </section>
+        <section class="properties-panel">
+          <div class="panel-title">
+            <strong>蒙版属性</strong><span>自动 + 手绘</span>
+          </div>
+          <details open>
+            <summary>
+              自动稳定区域
+              <input
+                id="auto-mask"
+                type="checkbox"
+                checked
+                aria-label="启用自动稳定区域蒙版"
+              />
+            </summary>
+            <div class="property-body">
+              <label class="range-label" for="threshold"
+                >稳定区域容差 <output id="threshold-out">1.5 px</output></label
+              ><input
+                id="threshold"
+                type="range"
+                min="0"
+                max="15"
+                step="0.5"
+                value="1.5"
+              /><label class="range-label" for="feather"
+                >自动区域羽化 <output id="feather-out">12 px</output></label
+              ><input
+                id="feather"
+                type="range"
+                min="0"
+                max="60"
+                step="1"
+                value="12"
+              />
+              <p class="small muted">
+                自动判断只是起点。手绘蒙版可覆盖任何区域，画笔硬度控制手绘软边。
+              </p>
+            </div>
+          </details>
+          <details>
+            <summary>
+              整张脸锁定
+              <input
+                id="face-enabled"
+                type="checkbox"
+                checked
+                aria-label="启用整张脸锁定"
+              />
+            </summary>
+            <div class="property-body">
+              <button class="button full" id="face-reselect">
+                重新框选脸部
+              </button>
+              <p id="face-status" class="small muted">尚未设置选区</p>
+              <label class="range-label" for="face-feather"
+                >脸部羽化 <output id="face-feather-out">8 px</output></label
+              ><input
+                id="face-feather"
+                type="range"
+                min="0"
+                max="30"
+                value="8"
+              /><label class="range-label" for="face-strength"
+                >脸部回贴强度
+                <output id="face-strength-out">100%</output></label
+              ><input
+                id="face-strength"
+                type="range"
+                min="0"
+                max="100"
+                value="100"
+              />
+              <p class="small muted">
+                整张脸来自原图，表情固定。跟随头部移动，不对五官做光流拉伸。
+              </p>
+            </div>
+          </details>
+          <details>
+            <summary>画笔与快捷键</summary>
+            <div class="property-body">
+              <p class="small muted">
+                不透明度：整笔覆盖上限。<br />流量：每次经过的累积速度。<br />Alt＋左/右键拖动调大小与硬度。<br />[
+                / ] 调大小，Shift+[ / ] 调硬度。<br />数字键调不透明度，Shift+数字调流量。<br />空格拖动画布，Alt+滚轮缩放。<br />Ctrl+Z
+                撤销，X 交换黑白。
+              </p>
+            </div>
+          </details>
+        </section>
+        <section class="output-panel">
+          <div class="panel-title">
+            <strong>导出</strong><span>文件保存在本机</span>
+          </div>
+          <div id="job-panel" hidden>
+            <div>
+              <strong id="job-title">正在处理</strong
+              ><span id="job-percent">0%</span>
+            </div>
+            <progress id="job-progress" max="100" value="0"></progress>
+            <p id="job-message"></p>
+            <button id="cancel-export" class="button danger" hidden>
+              终止导出
+            </button>
+          </div>
+          <div id="export-result" hidden>
+            <div>
+              <strong>最新完成</strong>
+              <p id="export-path"></p>
+            </div>
+            <button id="preview-export" class="button">播放成片</button
+            ><a id="download-video" class="button primary" download
+              >下载 MP4 ↓</a
+            >
+          </div>
+        </section>
+        <div class="local-note">
+          编辑自动保存 · Ctrl+Z 可撤销当前会话笔画<br />白笔/黑笔始终修改蒙版，不破坏原素材。
+        </div>
+      </aside>
+    </div>
+    <dialog id="import-dialog">
+      <form id="import-form">
+        <div class="dialog-head">
+          <h2>导入一组素材</h2>
+          <button type="button" data-close="import-dialog">×</button>
+        </div>
+        <p>一张原始图片 + 用它生成的视频。第一帧和原图越接近，对齐越稳定。</p>
+        <label class="file-field"
+          >原始图片<input
+            name="image"
+            id="image-file"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            required /></label
+        ><label class="file-field"
+          >生成视频<input
+            name="video"
+            id="video-file"
+            type="file"
+            accept="video/mp4,video/quicktime,video/webm"
+            required
+        /></label>
+        <p class="small muted">
+          素材只在本机处理。默认采用原视频尺寸与固定帧率。
+        </p>
+        <button class="button primary full" type="submit" id="start-import">
+          导入并自动对齐
+        </button>
+      </form>
+    </dialog>
+    <dialog id="help-dialog">
+      <div class="dialog-head">
+        <h2>三步擦回原图</h2>
+        <button data-close="help-dialog">×</button>
+      </div>
+      <ol class="help-steps">
+        <li>
+          <strong>导入、等待自动对齐</strong>
+          <p>
+            原图先匹配视频首帧，再跟踪每帧的局部运动，得到稳定区域蒙版。适用于人物、风景、产品等画面，不限
+            Live2D。
+          </p>
+        </li>
+        <li>
+          <strong>框住脸，涂白或涂黑</strong>
+          <p>
+            脸部按整张原图锁定；白笔恢复原图，黑笔保护视频运动。画笔大小控制范围，硬度控制羽化，不透明度控制整笔覆盖上限，流量控制每次经过的累积速度。同一笔反复涂抹可以累积，但不会超过该笔不透明度；松开再画可继续叠加。点击“原图画布”可在固定坐标中编辑。可撤销最近20次笔画/选区。Ctrl+Z
+            撤销；Alt+左键或右键拖动，横向调大小、纵向调硬度。
+          </p>
+        </li>
+        <li>
+          <strong>先看蒙版，再看合成</strong>
+          <p>
+            自动区域与脸部羽化越大，边缘越软，但有效范围会缩小；手绘区域由画笔硬度控制软边。Ctrl+加减号缩放，Ctrl+0适应窗口，Ctrl+1按当前预览像素100%显示。画布上方可选1/8、1/4、1/2、视频原尺寸、2倍或原图尺寸；大尺寸适合暂停看细节，刷新会更慢。空格+拖动平移；Ctrl+空格点击放大，Ctrl+Alt+空格点击缩小。暂停看脸和轮廓，再点播放检查是否抖动。导出时可选择视频原尺寸、原图尺寸或自定义尺寸，并可开启开源模型去噪超分。保留原帧率与音轨。
+          </p>
+        </li>
+      </ol>
+      <div class="tip amber">
+        这是传统图像对齐和合成工具，不会生成新的视角。大幅转头、遮挡、强烈光照变化可能出现贴片感；把这些区域涂黑，保留原视频。
+      </div>
+      <p class="small muted">
+        白＝原图，黑＝视频。图层开关用于快速对比。工程与导出保存在配置的数据目录，默认是程序目录下的
+        data 文件夹。
+      </p>
+    </dialog>
+    <dialog id="export-dialog">
+      <form id="export-form">
+        <div class="dialog-head">
+          <h2>导出尺寸与去噪超分</h2>
+          <button type="button" data-close="export-dialog">×</button>
+        </div>
+        <p class="small muted">
+          画布预览不含AI超分，模型效果以导出视频为准。先处理视频，再用高清原图回贴。回贴区域直接采样原始大图，不先降清晰度再放大。
+        </p>
+        <label class="export-field"
+          >导出尺寸<select id="export-size">
+            <option value="video">视频原尺寸</option>
+            <option value="2x">视频尺寸 ×2</option>
+            <option value="4x">视频尺寸 ×4</option>
+            <option value="original">使用原图尺寸</option>
+            <option value="custom">自定义尺寸</option>
+          </select></label
+        >
+        <div class="export-row">
+          <label class="export-field"
+            >宽度<input
+              id="export-width"
+              type="number"
+              min="2"
+              max="16384"
+              step="1"
+              required /></label
+          ><label class="export-field"
+            >高度<input
+              id="export-height"
+              type="number"
+              min="2"
+              max="16384"
+              step="1"
+              required
+          /></label>
+        </div>
+        <p id="export-size-note" class="small muted"></p>
+        <label class="export-field"
+          >视频放大方式<select id="export-upscale">
+            <option value="lanczos">快速缩放 · Lanczos（非模型超分）</option>
+            <option value="realesrgan">AI 去噪 + 4× 超分 · Real-ESRGAN</option>
+          </select></label
+        >
+        <div id="ai-options" hidden>
+          <label class="range-label" for="export-denoise"
+            >去噪强度 <output id="export-denoise-out">50%</output></label
+          ><input
+            id="export-denoise"
+            type="range"
+            min="0"
+            max="100"
+            step="5"
+            value="50"
+          />
+          <p class="small muted">
+            低：更多纹理与颗粒。高：更干净，也可能抹掉纹理。模型先做4×，再适配最终尺寸；不改变高清原图回贴内容。
+          </p>
+          <div class="export-row">
+            <label class="export-field"
+              >运算设备<select id="export-device">
+                <option value="auto">自动（优先 NVIDIA GPU）</option>
+                <option value="cuda">NVIDIA GPU</option>
+                <option value="cpu">CPU（较慢）</option>
+              </select></label
+            ><label class="export-field"
+              >模型分块<select id="export-tile">
+                <option value="96">96 · 更省显存</option>
+                <option value="192">192 · 默认</option>
+                <option value="256">256 · 更快，更多显存</option>
+              </select></label
+            >
+          </div>
+          <div class="tip">
+            开源模型：realesr-general-x4v3，使用官方强/弱去噪权重混合。逐帧处理，不是多帧时域去噪；原视频的闪烁仍可能保留。
+          </div>
+        </div>
+        <div id="large-export-warning" class="tip amber" hidden>
+          超大尺寸导出会明显增加时间、内存和文件大小。超过8K的MP4在部分浏览器/硬件播放器中可能无法播放，可以用本地软件播放器查看。
+        </div>
+        <button
+          type="submit"
+          class="button primary full"
+          id="confirm-export"
+          style="margin-top: 20px"
+        >
+          开始导出
+        </button>
+      </form>
+    </dialog>
+    <dialog id="video-dialog">
+      <div class="dialog-head">
+        <h2>导出视频 · 原帧率播放</h2>
+        <button data-close="video-dialog">×</button>
+      </div>
+      <video id="export-player" controls playsinline></video>
+    </dialog>
+    <div id="brush-hud" hidden></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "data_dir": "data",
+  "weights_dir": "models",
+  "sample_image": "",
+  "sample_video": "",
+  "sample_project": "sample"
+}
