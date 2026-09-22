@@ -27,6 +27,12 @@ def read_image(path):
         return cv2.cvtColor(np.array(ImageOps.exif_transpose(im).convert('RGB')), cv2.COLOR_RGB2BGR)
 
 
+def read_grayscale(path):
+    # cv2.imread on Windows can fail on non-ASCII paths; Pillow accepts Path.
+    with Image.open(path) as im:
+        return np.array(im.convert('L'))
+
+
 @lru_cache(maxsize=1)
 def cached_reference(path,modified):
     image=read_image(path)
@@ -150,6 +156,13 @@ class Project:
         self.export_status = {'phase': 'idle', 'progress': 0}
         if (self.path / 'meta.json').exists():
             self.meta = json.loads((self.path/'meta.json').read_text(encoding='utf-8'))
+            for key in ('image','video'):
+                recorded=Path(self.meta[key])
+                if not recorded.is_absolute():
+                    self.meta[key]=str((self.path/recorded).resolve())
+                elif not recorded.is_file() and (self.path/recorded.name).is_file():
+                    # Relocate projects written by versions that stored absolute paths.
+                    self.meta[key]=str((self.path/recorded.name).resolve())
             self._open_analysis()
             self.status = {'phase': 'ready', 'progress': 100, 'message': '已恢复上次工程'}
             exports=sorted((self.path/'exports').glob('restored-*.mp4'),key=lambda p:p.stat().st_mtime)
@@ -167,13 +180,13 @@ class Project:
         self.score = np.load(self.path/'motion.npy')
         self.reference = read_image(self.path/'aligned-reference.png')
         self.ref_small = cv2.resize(self.reference, (m['pw'], m['ph']), interpolation=cv2.INTER_AREA)
-        self.valid = cv2.imread(str(self.path/'valid.png'), cv2.IMREAD_GRAYSCALE)
+        self.valid = read_grayscale(self.path/'valid.png')
         self.restore = np.zeros((m['ph'], m['pw']), np.uint8)
         self.protect = self.restore.copy()
         for name in ['restore', 'protect']:
             p = self.path/f'{name}.png'
             if p.exists():
-                setattr(self, name, cv2.imread(str(p), cv2.IMREAD_GRAYSCALE))
+                setattr(self, name, read_grayscale(p))
         p = self.path/'edit.json'
         if p.exists():
             edits = json.loads(p.read_text(encoding='utf-8'))
@@ -277,7 +290,11 @@ class Project:
                              image_name=Path(image_path).name, video_name=Path(video_path).name,
                              alignment=info, matrix=matrix.tolist(), created=time.time())
             # Completion marker is written only after every analysis asset succeeds.
-            (self.path/'meta.json').write_text(json.dumps(self.meta, ensure_ascii=False, indent=2), encoding='utf-8')
+            portable_meta=dict(self.meta)
+            for key in ('image','video'):
+                try:portable_meta[key]=Path(self.meta[key]).resolve().relative_to(self.path.resolve()).as_posix()
+                except ValueError:pass
+            (self.path/'meta.json').write_text(json.dumps(portable_meta, ensure_ascii=False, indent=2), encoding='utf-8')
             self._open_analysis()
             self.save_edits()
             self.status = dict(phase='ready', progress=100, message='对齐完成，可以涂抹与预览')

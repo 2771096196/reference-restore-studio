@@ -37,6 +37,8 @@ flowchart LR
 
 ## 安装与运行
 
+Windows 用户可使用 **[便携整合包（测试版）](https://github.com/2771096196/reference-restore-studio/releases/tag/v0.2.0-portable-preview)**：完整解压后运行 `H3便携启动器.exe`，无需手动安装 Python 或 FFmpeg。包含 ComfyUI、原图回贴、模型目录复用、权重自动归位、断点下载与校验。面向 Windows 10/11 x64 与兼容 CUDA 13 的 NVIDIA RTX 显卡；显卡驱动仍需满足要求。详细步骤与限制见 [便携版说明](portable/README.md)。以下是从源码安装的步骤。
+
 推荐 **Python 3.12**。基础修复只需 CPU；AI 超分才需要 PyTorch / Spandrel。已在 Windows + Python 3.12 上测试，其他系统请自行验证。
 
 ### 1. FFmpeg
