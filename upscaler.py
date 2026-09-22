@@ -1,14 +1,23 @@
-"""Official Real-ESRGAN general-x4v3 checkpoints, tiled inference through Spandrel."""
+"""Official general and anime-video Real-ESRGAN models with tiled inference."""
 from pathlib import Path
 import cv2
 import numpy as np
 
 from config import WEIGHT_ROOT
 MODEL_NAMES=('realesr-general-x4v3.pth','realesr-general-wdn-x4v3.pth')
+MODEL_FILES={
+    'realesrgan':MODEL_NAMES,
+    'realesrgan-animevideo':('realesr-animevideov3.pth',),
+}
+MODEL_LABELS={'realesrgan':'realesr-general-x4v3','realesrgan-animevideo':'realesr-animevideov3'}
 
 
-def model_available():
-    return all((WEIGHT_ROOT/name).is_file() for name in MODEL_NAMES)
+def model_available(model='realesrgan'):
+    return model in MODEL_FILES and all((WEIGHT_ROOT/name).is_file() for name in MODEL_FILES[model])
+
+
+def model_availability():
+    return {model:model_available(model) for model in MODEL_FILES}
 
 
 class ExportCancelled(Exception):
@@ -16,21 +25,27 @@ class ExportCancelled(Exception):
 
 
 class RealESRGAN:
-    def __init__(self,denoise=.5,device='auto',tile=192):
+    def __init__(self,denoise=.5,device='auto',tile=192,model='realesrgan'):
         import torch
         import spandrel
         self.torch=torch
-        if not model_available():
-            raise ValueError('缺少官方 Real-ESRGAN 权重，请先运行 python download_models.py')
+        if model not in MODEL_FILES: raise ValueError('未知超分模型')
+        if not model_available(model):
+            raise ValueError(f'缺少 {MODEL_LABELS[model]} 权重，请先运行 python download_models.py')
+        self.name=MODEL_LABELS[model]
         if device=='cuda' and not torch.cuda.is_available():
             raise ValueError('CUDA 不可用，请选择 CPU')
         self.device='cuda' if device in ('auto','cuda') and torch.cuda.is_available() else 'cpu'
-        # Both files are official SRVGG checkpoints. Use safe tensor-only deserialization.
-        strong=torch.load(WEIGHT_ROOT/MODEL_NAMES[0],map_location='cpu',weights_only=True)
-        weak=torch.load(WEIGHT_ROOT/MODEL_NAMES[1],map_location='cpu',weights_only=True)
+        # Official SRVGG checkpoints, deserialized as tensors only.
+        strong=torch.load(WEIGHT_ROOT/MODEL_FILES[model][0],map_location='cpu',weights_only=True)
         strong=strong.get('params_ema',strong.get('params',strong))
-        weak=weak.get('params_ema',weak.get('params',weak))
-        weights={k:denoise*v+(1-denoise)*weak[k] for k,v in strong.items()}
+        if model=='realesrgan':
+            weak=torch.load(WEIGHT_ROOT/MODEL_NAMES[1],map_location='cpu',weights_only=True)
+            weak=weak.get('params_ema',weak.get('params',weak))
+            weights={k:denoise*v+(1-denoise)*weak[k] for k,v in strong.items()}
+        else:
+            # AnimeVideo has one checkpoint and no denoise-strength interpolation.
+            weights=strong
         self.model=spandrel.ModelLoader().load_from_state_dict(weights).eval().to(self.device)
         self.half=self.device=='cuda'
         if self.half: self.model.half()

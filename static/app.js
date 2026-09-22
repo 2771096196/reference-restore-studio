@@ -30,6 +30,7 @@ let editTarget = 'mask',
   strokeConfig = null;
 let strokeQueue = Promise.resolve(),
   pendingStrokes = 0;
+let liveBrush = null, brushDrawRequest = null;
 const previewChoices = {
   eighth: '1/8 · 最流畅',
   quarter: '1/4 · 流畅',
@@ -38,6 +39,31 @@ const previewChoices = {
   double: '2倍尺寸',
   original: '原图尺寸',
 };
+const viewInfo = {
+  composite: ['效果预览 · 不含AI超分', '回贴后的合成画面。画布清晰度只影响预览；最终尺寸与模型效果请用导出窗口的“预览当前帧”检查。'],
+  video: ['原视频 · 对比用', '未回贴、未超分的视频画面。这里不显示你擦回去的原图内容。'],
+  aligned: ['对齐原图 · 检查位置', '只显示对齐后的原图，不与底层视频混合，也不是最终成片。'],
+  mask: ['黑白蒙版 · 实际替换范围', '白色使用回贴结果，黑色保留当前视频，灰色按比例混合。柔边模式保留真实灰度；只有“整块锁色”会把涂到的范围全部固定。'],
+  overlay: ['回贴范围 · 与效果预览对齐', '底图就是当前帧的效果预览，黄色按同一份黑白蒙版标出实际替换范围。眼睛位置和边界与合成一致；黄色不会导出。'],
+  reference: ['原图画布 · 固定坐标编辑', '在原图坐标上涂抹蒙版或框选脸部。它不播放合成效果；查看结果请切回“效果预览”。'],
+};
+let exportPreviewBusy = false, exportPreviewUrl = null;
+
+function updateViewStatus(pending = false, failed = false) {
+  const info = viewInfo[shownView];
+  document.querySelectorAll('[data-view]').forEach(button => {
+    const selected = button.dataset.view === shownView;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-pressed', String(selected));
+    button.classList.toggle('pending', pending && button.dataset.view === view);
+  });
+  $('#view-name').textContent = pending
+    ? (view === shownView ? `正在更新${info[0]}…` : `正在加载${viewInfo[view][0]}；当前仍显示${info[0]}`)
+    : (failed ? '更新失败，仍显示：' : '') + info[0];
+  $('#view-description').textContent = info[1];
+  $('.view-explanation').classList.toggle('auxiliary', shownView !== 'composite');
+  $('#return-composite').hidden = shownView === 'composite' && view === 'composite';
+}
 let previewResolution = 'half';
 try {
   const saved = localStorage.getItem('retouch-preview-quality');
@@ -81,6 +107,9 @@ function timecode(f) {
 }
 function settingsFromUI() {
   return {
+    alignment_mode: $('#alignment-mode').value,
+    alignment_frame: +( $('#alignment-frame-label').dataset.frame || 0),
+    paint_blend: $('#paint-blend').value,
     enabled: $('#layer-enabled').checked,
     auto: $('#auto-mask').checked,
     threshold: +$('#threshold').value,
@@ -102,10 +131,19 @@ function labels() {
     ['brush-hardness', '%'],
     ['brush-opacity', '%'],
     ['brush-flow', '%'],
-  ])
-    $('#' + id + '-out').textContent = $('#' + id).value + unit;
+  ]) {
+    const output = $('#' + id + '-out');
+    if (output.tagName === 'INPUT') output.value = $('#' + id).value;
+    else output.textContent = $('#' + id).value + unit;
+  }
+  for (const name of ['hardness','opacity','flow']) $('#brush-demo-' + name).value = $('#brush-' + name).value;
+  drawBrushDemo();
 }
 function fillSettings(s) {
+  $('#alignment-mode').value = s.alignment_mode || 'fixed';
+  $('#paint-blend').value = s.paint_blend || 'soft';
+  $('#alignment-frame-label').dataset.frame = s.alignment_frame || 0;
+  alignmentLabels();
   $('#layer-enabled').checked = s.enabled !== false;
   $('#auto-mask').checked = s.auto;
   $('#threshold').value = s.threshold;
@@ -115,6 +153,16 @@ function fillSettings(s) {
   $('#face-feather').value = s.face_feather;
   $('#face-strength').value = s.face_strength * 100;
   labels();
+}
+function alignmentLabels() {
+  const fixed = $('#alignment-mode').value === 'fixed';
+  $('#alignment-fixed-controls').hidden = !fixed;
+  $('#alignment-frame-label').textContent = `固定到第 ${+( $('#alignment-frame-label').dataset.frame || 0) + 1} 帧`;
+  $('#alignment-note').textContent = fixed
+    ? ($('#paint-blend').value === 'soft'
+      ? '原图位置固定。实色中心保持稳定，灰色软边按不透明度与视频混合；软边颜色会随底层变化。画面移动时固定区域可能错位。'
+      : '所有涂到的像素锁为对齐帧合成颜色，软边也会整块替换。要保留PS式灰度和渐变，请选柔边混合。')
+    : '原图和蒙版随每帧光流变化；细小跟踪误差可能造成五官抖动。';
 }
 function updateHint() {
   const hints = {
@@ -196,9 +244,7 @@ function refreshThumbnails() {
 function setView(v) {
   pause();
   view = v;
-  document
-    .querySelectorAll('[data-view]')
-    .forEach((b) => b.classList.toggle('selected', b.dataset.view === view));
+  updateViewStatus(true);
   refresh();
   updateHint();
 }
@@ -292,6 +338,7 @@ async function refresh() {
   const timer = setTimeout(() => controller.abort(), 45000);
   let url = null;
   document.body.classList.add('preview-loading');
+  updateViewStatus(true);
   $('#preview-label').textContent = '更新预览…';
   try {
     const r = await fetch(
@@ -314,6 +361,7 @@ async function refresh() {
     if (previous) URL.revokeObjectURL(previous);
     shownFrame = f;
     shownView = v;
+    updateViewStatus();
     canvas.width = project.meta.pw;
     canvas.height = project.meta.ph;
     cursor.width = canvas.width;
@@ -326,8 +374,11 @@ async function refresh() {
     drawOverlay();
     refreshThumbnails();
   } catch (e) {
-    if (id === refreshId && e.name !== 'AbortError')
+    if (id === refreshId) {
+      updateViewStatus(false, true);
+      if (e.name !== 'AbortError')
       toast('预览暂未更新：' + e.message);
+    }
   } finally {
     clearTimeout(timer);
     if (url && image.dataset.blob !== url) URL.revokeObjectURL(url);
@@ -414,7 +465,8 @@ async function poll() {
       fillSettings(s.settings);
       updatePreviewOptions();
       revision = s.revision;
-      $('#brush-size').max = Math.max(6, Math.floor(s.meta.width / 2));
+      $('#brush-size').max = Math.max(1, Math.floor(s.meta.width / 2));
+      $('#brush-size-out').max = $('#brush-size').max;
       fitCanvas();
       refresh();
       updateHint();
@@ -451,6 +503,8 @@ async function poll() {
         '/api/download/' + encodeURIComponent(completed.filename);
       $('#download-video').download = completed.filename;
       $('#preview-export').dataset.filename = completed.filename;
+      $('#open-export-folder').dataset.filename = completed.filename;
+      $('#open-export-folder').dataset.project = s.project;
     } else if (s.export?.phase === 'error') {
       $('#job-panel').hidden = false;
       $('#job-title').textContent = '导出失败';
@@ -468,14 +522,17 @@ async function changeSettings() {
   if (!ready()) return;
   pause();
   clearTimeout(settingsTimer);
-  settingsPromise = api('settings', settingsFromUI())
+  const requestedSettings = settingsFromUI();
+  settingsPromise = api('settings', requestedSettings)
     .then(async (r) => {
+      project.settings = requestedSettings;
       project.revision = r.revision;
       revision = r.revision;
       void refresh();
       return true;
     })
     .catch((e) => {
+      fillSettings(project.settings);
       toast(e.message);
       return false;
     });
@@ -484,10 +541,13 @@ async function changeSettings() {
 document
   .querySelectorAll('[data-view]')
   .forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+$('#return-composite').onclick = () => setView('composite');
 document
   .querySelectorAll('[data-tool]')
   .forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
 for (const id of [
+  'alignment-mode',
+  'paint-blend',
   'layer-enabled',
   'auto-mask',
   'threshold',
@@ -499,9 +559,21 @@ for (const id of [
 ])
   $('#' + id).addEventListener('input', () => {
     labels();
+    alignmentLabels();
     clearTimeout(settingsTimer);
     settingsTimer = setTimeout(changeSettings, 170);
   });
+async function lockAlignment(index) {
+  if (!ready()) return;
+  pause();
+  await strokeQueue;
+  $('#alignment-mode').value = 'fixed';
+  $('#alignment-frame-label').dataset.frame = index;
+  alignmentLabels();
+  if (await changeSettings()) toast(`已固定到第 ${index + 1} 帧；${$('#paint-blend').value === 'soft' ? '实色中心固定，软边自然混合' : '涂抹区域整块锁色'}。`);
+}
+$('#alignment-lock-current').onclick = () => lockAlignment(shownFrame);
+$('#alignment-lock-first').onclick = () => lockAlignment(0);
 for (const id of [
   'brush-size',
   'brush-hardness',
@@ -509,6 +581,56 @@ for (const id of [
   'brush-flow',
 ])
   $('#' + id).addEventListener('input', labels);
+
+for (const id of ['brush-size','brush-hardness','brush-opacity','brush-flow']) {
+  const number = $('#' + id + '-out'), slider = $('#' + id);
+  number.addEventListener('input', () => {
+    if (number.value === '' || !Number.isFinite(number.valueAsNumber)) return;
+    slider.value = Math.max(+slider.min, Math.min(+slider.max, number.valueAsNumber));
+    labels();
+    if (lastPointer) drawCursor(lastPointer, true);
+  });
+  number.addEventListener('blur', labels);
+}
+function drawBrushDemo() {
+  const demo = $('#brush-tip-preview');
+  if (!demo) return;
+  const context = demo.getContext('2d'), width = demo.width, height = demo.height;
+  for (let y=0;y<height;y+=10) for (let x=0;x<width;x+=10) {
+    context.fillStyle = (x/10+y/10)%2 ? '#d0d0d0' : '#f0f0f0';context.fillRect(x,y,10,10);
+  }
+  const stroke = new BrushStroke(width,height,24,+$('#brush-hardness').value/100,+$('#brush-opacity').value/100,+$('#brush-flow').value/100,+$('#brush-spacing').value/100);
+  stroke.add(35,38);stroke.add(365,38);
+  const repeated = new BrushStroke(width,height,24,stroke.hardness,stroke.opacity,stroke.flow,+$('#brush-spacing').value/100);
+  repeated.add(35,112);repeated.add(365,112);repeated.add(35,112);repeated.add(365,112);
+  const layer = document.createElement('canvas');layer.width=width;layer.height=height;
+  for (const brush of [stroke,repeated]) { brush.render(layer.getContext('2d'),[15,15,15]);context.drawImage(layer,0,0); }
+}
+$('#brush-settings-button').onclick = () => { drawBrushDemo();$('#brush-settings-dialog').showModal(); };
+for (const name of ['hardness','opacity','flow']) {
+  const number = $('#brush-demo-' + name), slider = $('#brush-' + name);
+  number.oninput = () => {
+    if (number.value === '' || !Number.isFinite(number.valueAsNumber)) return;
+    slider.value = Math.max(+slider.min,Math.min(+slider.max,number.valueAsNumber));
+    labels();
+  };
+  number.onblur = labels;
+}
+$('#brush-spacing').oninput = () => { $('#brush-spacing-out').textContent=$('#brush-spacing').value+'%';drawBrushDemo(); };
+document.querySelectorAll('[data-brush-hardness]').forEach(button => button.onclick = () => {
+  $('#brush-hardness').value=button.dataset.brushHardness;labels();
+});
+
+function paintLiveBrush() {
+  if (brushDrawRequest) return;
+  brushDrawRequest = requestAnimationFrame(() => {
+    brushDrawRequest = null;
+    if (!drawing || !liveBrush || tool === 'face') return;
+    const color = strokeConfig.mode === 'restore' ? [244,200,125] : strokeConfig.mode === 'protect' ? [20,28,34] : [135,175,190];
+    liveBrush.render(ctx,color,.8);
+    $('#preview-label').textContent='笔触预览 · 松开后应用到合成';
+  });
+}
 $('#face-button').onclick = () => setTool('face');
 function coords(e) {
   const r = image.getBoundingClientRect();
@@ -626,6 +748,7 @@ canvas.addEventListener('pointerdown', (e) => {
     hardness: +$('#brush-hardness').value / 100,
     opacity: +$('#brush-opacity').value / 100,
     flow: +$('#brush-flow').value / 100,
+    spacing: +$('#brush-spacing').value / 100,
     mode: tool,
     frame: shownFrame,
     space: shownView === 'reference' ? 'reference' : 'current',
@@ -634,6 +757,11 @@ canvas.addEventListener('pointerdown', (e) => {
   canvas.setPointerCapture(e.pointerId);
   points = [coords(e)];
   selectionStart = points[0];
+  if (tool !== 'face') {
+    liveBrush = new BrushStroke(canvas.width,canvas.height,strokeConfig.radius*canvas.width,strokeConfig.hardness,strokeConfig.opacity,strokeConfig.flow,strokeConfig.spacing);
+    liveBrush.add(Math.min(canvas.width-1,points[0][0]*canvas.width),Math.min(canvas.height-1,points[0][1]*canvas.height));
+    paintLiveBrush();
+  }
   e.preventDefault();
 });
 canvas.addEventListener('pointermove', (e) => {
@@ -646,7 +774,7 @@ canvas.addEventListener('pointermove', (e) => {
     const dx = e.clientX - gesture.x,
       dy = e.clientY - gesture.y;
     $('#brush-size').value = Math.max(
-      6,
+      1,
       Math.min(
         +$('#brush-size').max,
         Math.round(gesture.size + dx * gesture.scale),
@@ -682,21 +810,8 @@ canvas.addEventListener('pointermove', (e) => {
       (pt[1] - selectionStart[1]) * canvas.height,
     );
   } else {
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.strokeStyle =
-      tool === 'restore'
-        ? 'rgba(244,200,125,.65)'
-        : tool === 'protect'
-          ? 'rgba(20,28,34,.8)'
-          : 'rgba(135,175,190,.6)';
-    ctx.lineWidth =
-      (+$('#brush-size').value / project.meta.width) * canvas.width;
-    const last = points[points.length - 2];
-    ctx.beginPath();
-    ctx.moveTo(last[0] * canvas.width, last[1] * canvas.height);
-    ctx.lineTo(pt[0] * canvas.width, pt[1] * canvas.height);
-    ctx.stroke();
+    if (liveBrush) liveBrush.add(Math.min(canvas.width-1,pt[0]*canvas.width),Math.min(canvas.height-1,pt[1]*canvas.height));
+    paintLiveBrush();
   }
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -952,17 +1067,27 @@ function updateExportDialog() {
     oh = Math.ceil(h / 2) * 2;
   $('#export-size-note').textContent =
     `输出 ${ow}×${oh} · ${((ow * oh) / 1000000).toFixed(1)}百万像素。原图 ${project.meta.image_width}×${project.meta.image_height}；视频 ${project.meta.width}×${project.meta.height}。比例不同时按目标尺寸缩放，奇数边长会补至偶数。`;
-  $('#ai-options').hidden = $('#export-upscale').value !== 'realesrgan';
+  const model = $('#export-upscale').value;
+  $('#ai-options').hidden = model === 'lanczos';
+  $('#preview-export-frame').textContent = model === 'lanczos'
+    ? '预览当前帧 · 按导出尺寸' : '预览当前帧 · 含所选超分';
+  $('#denoise-options').hidden = model !== 'realesrgan';
+  $('#export-model-note').textContent = model === 'realesrgan-animevideo'
+    ? '动漫视频模型：realesr-animevideov3，适合动画线条和色块，无可调去噪强度。模型先做4×，再适配最终尺寸。逐帧处理，不做跨帧稳定；原图回贴区域仍直接采样原图。'
+    : '通用图片模型：realesr-general-x4v3，使用官方强/弱去噪权重混合，对视频逐帧处理。不是多帧时域去噪，原视频的闪烁仍可能保留。';
   $('#export-denoise-out').textContent = $('#export-denoise').value + '%';
   $('#large-export-warning').hidden = ow <= 4096 && oh <= 4096;
-  $('#confirm-export').disabled =
+  const invalid =
     !Number.isInteger(w) ||
     !Number.isInteger(h) ||
     w < 2 ||
     h < 2 ||
     w > 16384 ||
     h > 16384 ||
-    w * h > 60000000;
+    w * h > 60000000 ||
+    Boolean($('#export-upscale').selectedOptions[0]?.disabled);
+  $('#confirm-export').disabled = invalid || exportPreviewBusy || exportSubmitting;
+  $('#preview-export-frame').disabled = invalid || exportPreviewBusy || exportSubmitting;
 }
 $('#export-button').onclick = () => {
   if (!ready()) return;
@@ -975,10 +1100,16 @@ $('#export-button').onclick = () => {
   $('#export-denoise').value = (o.denoise ?? 0.5) * 100;
   $('#export-device').value = o.device || 'auto';
   $('#export-tile').value = o.tile || 192;
-  const choice = $('#export-upscale').querySelector(
-    'option[value="realesrgan"]',
-  );
-  choice.disabled = !project.super_resolution?.available;
+  for (const model of ['realesrgan', 'realesrgan-animevideo']) {
+    const choice = $('#export-upscale').querySelector(`option[value="${model}"]`);
+    const available = project.super_resolution?.models?.[model] ??
+      (model === 'realesrgan' && project.super_resolution?.available);
+    choice.disabled = !available;
+    const label = model === 'realesrgan'
+      ? '通用图片模型 · Real-ESRGAN（可调去噪）'
+      : '动漫视频模型 · Real-ESRGAN AnimeVideo v3';
+    choice.textContent = label + (available ? '' : '（未安装）');
+  }
   updateExportDialog();
   $('#export-dialog').showModal();
 };
@@ -990,15 +1121,9 @@ for (const id of [
   'export-denoise',
 ])
   $('#' + id).addEventListener('input', updateExportDialog);
-$('#export-form').onsubmit = async (e) => {
-  e.preventDefault();
-  if (exportSubmitting) return;
-  exportSubmitting = true;
-  $('#confirm-export').disabled = true;
-  $('#confirm-export').textContent = '正在启动…';
-  clearTimeout(settingsTimer);
+function exportOptionsFromUI() {
   const [width, height] = exportDimensions();
-  const options = {
+  return {
     size_mode: $('#export-size').value,
     width,
     height,
@@ -1007,6 +1132,55 @@ $('#export-form').onsubmit = async (e) => {
     device: $('#export-device').value,
     tile: +$('#export-tile').value,
   };
+}
+$('#preview-export-frame').onclick = async () => {
+  if (exportPreviewBusy || exportSubmitting || !ready()) return;
+  const options = exportOptionsFromUI(), index = shownFrame;
+  const modelLabel = $('#export-upscale').selectedOptions[0].textContent;
+  exportPreviewBusy = true;
+  updateExportDialog();
+  $('#export-preview-image').hidden = true;
+  $('#export-preview-download').hidden = true;
+  $('#export-preview-status').textContent = `正在按当前导出设置生成第 ${index + 1} 帧，请稍候…`;
+  $('#export-preview-dialog').showModal();
+  try {
+    await strokeQueue;
+    if (!(await changeSettings())) throw Error('编辑设置未保存，请重试');
+    const response = await fetch('/api/export-preview', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({frame: index, options}),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let message = text;
+      try { message = JSON.parse(text).error || text; } catch {}
+      throw Error(message);
+    }
+    const nextUrl = URL.createObjectURL(await response.blob());
+    const oldUrl = exportPreviewUrl;
+    exportPreviewUrl = nextUrl;
+    $('#export-preview-image').src = nextUrl;
+    await $('#export-preview-image').decode();
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+    $('#export-preview-image').hidden = false;
+    $('#export-preview-download').href = nextUrl;
+    $('#export-preview-download').hidden = false;
+    $('#export-preview-status').textContent = `第 ${index + 1} 帧 · ${$('#export-preview-image').naturalWidth}×${$('#export-preview-image').naturalHeight} · ${modelLabel}。下图适应窗口显示，可下载原尺寸检查。`;
+  } catch (e) {
+    $('#export-preview-status').textContent = '预览生成失败：' + e.message;
+  } finally {
+    exportPreviewBusy = false;
+    updateExportDialog();
+  }
+};
+$('#export-form').onsubmit = async (e) => {
+  e.preventDefault();
+  if (exportSubmitting || exportPreviewBusy) return;
+  exportSubmitting = true;
+  $('#confirm-export').disabled = true;
+  $('#confirm-export').textContent = '正在启动…';
+  clearTimeout(settingsTimer);
+  const options = exportOptionsFromUI();
   try {
     await strokeQueue;
     const applied = await changeSettings();
@@ -1043,6 +1217,22 @@ $('#cancel-export').onclick = cancelExport;
 $('#top-cancel-export').onclick = cancelExport;
 $('#top-export-state').onclick = () =>
   $('#job-panel').scrollIntoView({ behavior: 'smooth', block: 'center' });
+$('#open-export-folder').onclick = async () => {
+  const button = $('#open-export-folder');
+  if (button.disabled) return;
+  const request = {project: button.dataset.project, filename: button.dataset.filename};
+  button.disabled = true;
+  button.textContent = '正在打开…';
+  try {
+    await api('open-export-folder', request);
+    toast('已打开成片所在文件夹。');
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = '打开文件夹';
+  }
+};
 $('#preview-export').onclick = () => {
   $('#export-player').src =
     '/api/export-video/' +

@@ -12,12 +12,13 @@ import av
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
-from upscaler import RealESRGAN, ExportCancelled, model_available
+from upscaler import RealESRGAN, ExportCancelled, model_available, MODEL_FILES, MODEL_LABELS
 
 cv2.setNumThreads(2)
 
 DEFAULTS = dict(enabled=True, auto=True, threshold=1.5, feather=12, strength=1.0,
-                face=True, face_feather=8, face_strength=1.0)
+                face=True, face_feather=8, face_strength=1.0,
+                alignment_mode='fixed', alignment_frame=0, paint_blend='soft')
 EXPORT_DEFAULTS=dict(size_mode='video',width=1920,height=1080,upscale='lanczos',denoise=.5,device='auto',tile=192)
 
 
@@ -65,37 +66,42 @@ def feather_inside(mask, pixels):
     return (ramp * ramp * (3 - 2 * ramp)).astype(np.float32)
 
 
-def brush_coverage(coords,shape,radius,hardness,opacity,flow):
-    """Flow accumulates per evenly-spaced dab; opacity caps one uninterrupted stroke."""
+def brush_coverage(coords,shape,radius,hardness,opacity,flow,spacing=.1):
+    """Soft round tip; opacity caps one stroke, flow builds per spaced dab.
+
+    At full flow the stroke uses maximum tip coverage so overlapping dabs do
+    not harden the soft edge. Lower flow accumulates with source-over blending.
+    Centers and radius remain fractional, independent of pointer event density.
+    """
     ph,pw=shape
     coverage=np.zeros(shape,np.float32)
     if not coords or opacity==0 or flow==0: return coverage
-    r=max(1,radius)
-    axis=np.arange(-r,r+1,dtype=np.float32)
-    xx,yy=np.meshgrid(axis,axis)
-    distance=np.sqrt(xx*xx+yy*yy)/r
-    falloff=np.clip((1-distance)/max(.001,1-hardness),0,1)
-    stamp=falloff*falloff*(3-2*falloff)*flow
-    spacing=max(1,r*.15)
-    dabs=[coords[0]]
-    until_next=spacing
+    r=max(.25,float(radius));step=max(.25,2*r*spacing)
+    dabs=[coords[0]];until_next=step
     for a,b in zip(coords,coords[1:]):
-        a=np.asarray(a,dtype=np.float32); b=np.asarray(b,dtype=np.float32)
+        a=np.asarray(a,dtype=np.float64);b=np.asarray(b,dtype=np.float64)
         distance=float(np.linalg.norm(b-a))
         if distance==0: continue
         offset=until_next
-        while offset<=distance:
-            point=a+(b-a)*(offset/distance)
-            dabs.append((round(float(point[0])),round(float(point[1]))))
-            offset+=spacing
+        while offset<=distance+1e-9:
+            dabs.append(a+(b-a)*(offset/distance))
+            offset+=step
         until_next=offset-distance
     for x,y in dabs:
-        x,y=round(x),round(y)
-        x0,y0,x1,y1=max(0,x-r),max(0,y-r),min(pw,x+r+1),min(ph,y+r+1)
+        x0,y0=max(0,math.floor(x-r-.5)),max(0,math.floor(y-r-.5))
+        x1,y1=min(pw,math.ceil(x+r+.5)+1),min(ph,math.ceil(y+r+.5)+1)
         if x0>=x1 or y0>=y1: continue
-        part=stamp[y0-y+r:y1-y+r,x0-x+r:x1-x+r]
+        xx,yy=np.meshgrid(np.arange(x0,x1,dtype=np.float64)-x,np.arange(y0,y1,dtype=np.float64)-y)
+        distance=np.sqrt(xx*xx+yy*yy)
+        edge=np.clip(r+.5-distance,0,1)
+        if hardness>=1:
+            tip=edge
+        else:
+            t=np.clip((r-distance)/max(r*(1-hardness),.001),0,1)
+            tip=t*t*(3-2*t)*edge
         region=coverage[y0:y1,x0:x1]
-        coverage[y0:y1,x0:x1]=region+part*(1-region)
+        if flow>=1: np.maximum(region,tip,out=region)
+        else: region+=tip*flow*(1-region)
     return coverage*opacity
 
 
@@ -289,21 +295,83 @@ class Project:
                                 self.face_region[:] if self.face_region else None))
         self.undo_stack = self.undo_stack[-20:]
 
-    def stroke(self, points, radius, mode, index, space, hardness=.5, opacity=1.0, flow_rate=1.0):
+    @lru_cache(maxsize=8)
+    def fixed_alignment(self, index):
+        """One global alignment to the anchor frame, reused for the whole clip.
+
+        Masks live in first-frame coordinates. Do not freeze a dense optical-flow
+        field: it would still distort the reference's eyes at the chosen frame.
+        """
+        pw,ph=self.meta['pw'],self.meta['ph']
+        if index==0:
+            matrix=np.array([[1,0,0],[0,1,0]],np.float32)
+        else:
+            first=read_image(self.path/'frames'/'00000.png')
+            anchor=read_image(self.path/'frames'/f'{index:05d}.png')
+            matrix,info=align_reference(first,anchor)
+            if info['inliers']<12 or info['method']!='特征匹配 + 旋转/缩放对齐':
+                raise ValueError('此帧无法可靠固定对齐，请选择更接近首帧的画面，或固定到第1帧')
+        inverse=cv2.invertAffineTransform(matrix)
+        x,y=np.meshgrid(np.arange(pw,dtype=np.float32),np.arange(ph,dtype=np.float32))
+        flow=np.stack((inverse[0,0]*x+inverse[0,1]*y+inverse[0,2]-x,
+                       inverse[1,0]*x+inverse[1,1]*y+inverse[1,2]-y),axis=-1)
+        flow.flags.writeable=False
+        matrix.flags.writeable=False
+        return flow,matrix
+
+    def alignment_flow(self,index,settings):
+        if settings.get('alignment_mode','tracked')=='fixed':
+            return self.fixed_alignment(settings.get('alignment_frame',0))[0]
+        return self.back[index].astype(np.float32)
+
+    def fixed_paint_support(self,s,size):
+        settings=s['settings']
+        if (settings.get('alignment_mode','tracked')!='fixed' or settings.get('paint_blend','frozen')!='frozen' or
+                not settings.get('enabled',True) or settings['strength']==0 or not s['restore'].any()):
+            return None
+        manual=np.minimum(s['restore'].astype(np.float32)/255,1-s['protect'].astype(np.float32)/255)
+        manual*=self.valid.astype(np.float32)/255
+        support=remap(manual,self.alignment_flow(settings.get('alignment_frame',0),settings))
+        return cv2.resize(support,size,interpolation=cv2.INTER_LINEAR)>0
+
+    def fixed_paint_patch(self,s,size):
+        """Freeze final blended RGB, including partial-opacity/soft brush pixels.
+
+        Freezing just the reference image is insufficient: the changing video
+        underneath would still flicker through translucent paint. Cache an anchor
+        composite and paste its painted support identically into every frame.
+        """
+        settings=s['settings']
+        support=self.fixed_paint_support(s,size)
+        if support is None: return None
+        key=(size,tuple(sorted(settings.items())),tuple(s['face_region'] or ()),
+             s['restore'].tobytes(),s['protect'].tobytes())
+        with self.lock:
+            cached=getattr(self,'_paint_patch',None)
+            if cached is not None and cached[0]==key: return cached[1]
+            anchor=settings.get('alignment_frame',0)
+            source=self.original_frame(anchor)
+            reference=cached_reference(self.meta['image'],Path(self.meta['image']).stat().st_mtime_ns)
+            patch=self.compose_target(anchor,source,s,size,reference,_lock_paint=False)
+            result=(support,patch)
+            self._paint_patch=(key,result)
+            return result
+
+    def stroke(self, points, radius, mode, index, space, hardness=.5, opacity=1.0, flow_rate=1.0, spacing=.1):
         with self.lock:
             if opacity==0 or flow_rate==0: return
             self.push_undo()
             pw, ph = self.meta['pw'], self.meta['ph']
-            flow = self.back[index].astype(np.float32)
+            flow = self.alignment_flow(index,self.settings)
             coords = []
             for x, y in points:
                 px, py = np.clip(x*pw, 0, pw-1), np.clip(y*ph, 0, ph-1)
                 if space != 'reference':
                     dx, dy = flow[round(py), round(px)]
                     px, py = px+dx, py+dy
-                coords.append((int(round(px)), int(round(py))))
-            r = max(1, int(radius * pw))
-            brush=brush_coverage(coords,(ph,pw),r,hardness,opacity,flow_rate)
+                coords.append((float(px), float(py)))
+            r = max(.25, radius * pw)
+            brush=brush_coverage(coords,(ph,pw),r,hardness,opacity,flow_rate,spacing)
             restore=self.restore.astype(np.float32)/255
             protect=self.protect.astype(np.float32)/255
             if mode == 'restore':
@@ -335,17 +403,25 @@ class Project:
         return matrix.astype(np.float32)
 
     def restoration_masks(self,index,s):
-        m=self.meta; settings=s['settings']; flow=self.back[index].astype(np.float32)
+        m=self.meta; settings=s['settings']; flow=self.alignment_flow(index,settings)
         mask=(self.score<settings['threshold']).astype(np.float32) if settings['auto'] else np.zeros_like(self.score)
         mask=feather_inside(mask,settings['feather']*m['pw']/m['width'])
         white=s['restore'].astype(np.float32)/255
         black=s['protect'].astype(np.float32)/255
+        white=np.minimum(white,1-black)
         valid=self.valid.astype(np.float32)/255
-        automatic=mask*(1-white)*(1-black)*valid
-        manual=white*(1-black)*valid
-        roundtrip=flow+remap(self.forward[index].astype(np.float32),flow)
-        confidence=np.clip(1-(np.linalg.norm(roundtrip,axis=2)-.75)/2,0,1)
-        alpha=remap(automatic,flow)*confidence+remap(manual,flow)
+        # White and black are mutually exclusive paint contributions. Their
+        # source-over updates already attenuate the other color in stroke().
+        # Multiplying (1-black) again would square opacity (50% -> 25%).
+        automatic=mask*np.clip(1-white-black,0,1)*valid
+        manual=white*valid
+        if settings.get('alignment_mode','tracked')=='fixed':
+            # Both image mapping and opacity remain identical across frames.
+            alpha=remap(automatic+manual,flow)
+        else:
+            roundtrip=flow+remap(self.forward[index].astype(np.float32),flow)
+            confidence=np.clip(1-(np.linalg.norm(roundtrip,axis=2)-.75)/2,0,1)
+            alpha=remap(automatic,flow)*confidence+remap(manual,flow)
         face_mask=None; matrix=None
         if settings['face'] and s['face_region']:
             pw,ph=m['pw'],m['ph']; x0,y0,x1,y1=s['face_region']
@@ -354,52 +430,56 @@ class Project:
                         (max(1,round((x1-x0)/2*pw)),max(1,round((y1-y0)/2*ph))),0,0,360,1,-1)
             face_mask=feather_inside(face_mask*valid,settings['face_feather']*pw/m['width'])*(1-black)
             face_mask*=settings['face_strength']
-            matrix=self.rigid_face_matrix(index,s['face_region'])
+            matrix=(self.fixed_alignment(settings.get('alignment_frame',0))[1].copy()
+                    if settings.get('alignment_mode','tracked')=='fixed'
+                    else self.rigid_face_matrix(index,s['face_region']))
         return alpha,face_mask,matrix
 
+    def composition_masks(self,index,s,size):
+        """Target-space masks shared by compositing and every coverage view."""
+        alpha,face,matrix=self.restoration_masks(index,s)
+        alpha=cv2.resize(alpha,size,interpolation=cv2.INTER_LINEAR)
+        if face is None: return alpha,None,matrix
+        width,height=size;pw,ph=self.meta['pw'],self.meta['ph']
+        inverse=cv2.invertAffineTransform(matrix)
+        target_face=np.empty((height,width),np.float32)
+        x=(np.arange(width,dtype=np.float32)+.5)*pw/width-.5
+        for top in range(0,height,128):
+            bottom=min(height,top+128)
+            y=(np.arange(top,bottom,dtype=np.float32)+.5)*ph/height-.5
+            cx,cy=np.meshgrid(x,y)
+            qx=inverse[0,0]*cx+inverse[0,1]*cy+inverse[0,2]
+            qy=inverse[1,0]*cx+inverse[1,1]*cy+inverse[1,2]
+            target_face[top:bottom]=cv2.remap(face,qx,qy,cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT)
+        return alpha,target_face,matrix
+
+    def composition_coverage(self,index,s,size):
+        """Contribution of the replacement result, including opaque frozen paint.
+
+        Frozen paint can contain a translucent reference mixed with the anchor
+        video, but that *finished mixture* replaces the live video completely.
+        Its coverage must therefore be one, including its soft painted edges.
+        """
+        if not s['settings'].get('enabled',True): return np.zeros((size[1],size[0]),np.float32)
+        alpha,face,_=self.composition_masks(index,s,size)
+        if face is not None: alpha=alpha*(1-face)+face
+        alpha*=s['settings']['strength']
+        support=self.fixed_paint_support(s,size)
+        if support is not None: alpha[support]=1
+        return np.clip(alpha,0,1)
+
     def compose(self, index, full=False, snapshot=None, frame=None):
-        m=self.meta
-        s=snapshot or self.snapshot()
-        settings=s['settings']
-        width,height=(m['width'],m['height']) if full else (m['pw'],m['ph'])
-        if frame is None:
-            frame=read_image(self.path/'frames'/f'{index:05d}.png')
-        flow=self.back[index].astype(np.float32)
-        reference=self.reference if full else self.ref_small
-        warping=scaled_flow(flow,width,height) if full else flow
-        warped=remap(reference,warping)
-        if not settings.get('enabled', True):
-            return frame.copy(),warped,np.zeros((height,width),np.float32),frame
-        alpha,face_mask,matrix=self.restoration_masks(index,s)
-        if full:
-            alpha=cv2.resize(alpha,(width,height),interpolation=cv2.INTER_LINEAR)
-        merged=frame.astype(np.float32)*(1-alpha[...,None])+warped.astype(np.float32)*alpha[...,None]
-        if face_mask is not None:
-            pw,ph=m['pw'],m['ph']
-            if full:
-                matrix[:,2]*=width/pw
-                face_mask=cv2.resize(face_mask,(width,height),interpolation=cv2.INTER_LINEAR)
-            face_alpha=cv2.warpAffine(face_mask,matrix,(width,height))
-            face_ref=cv2.warpAffine(reference,matrix,(width,height),borderMode=cv2.BORDER_REFLECT_101)
-            merged=merged*(1-face_alpha[...,None])+face_ref*face_alpha[...,None]
-            warped=warped*(1-face_alpha[...,None])+face_ref*face_alpha[...,None]
-            alpha=alpha*(1-face_alpha)+face_alpha
-        merged=frame*(1-settings['strength'])+merged*settings['strength']
-        alpha*=settings['strength']
-        return np.clip(merged,0,255).astype(np.uint8),np.clip(warped,0,255).astype(np.uint8),np.clip(alpha,0,1),frame
+        m=self.meta;s=snapshot or self.snapshot()
+        size=(m['width'],m['height']) if full else (m['pw'],m['ph'])
+        if frame is None: frame=self.original_frame(index)
+        raw=cv2.resize(frame,size,interpolation=cv2.INTER_LANCZOS4)
+        reference=cached_reference(m['image'],Path(m['image']).stat().st_mtime_ns)
+        merged=self.compose_target(index,frame,s,size,reference)
+        aligned=self.compose_target(index,frame,s,size,reference,mode='aligned')
+        return merged,aligned,self.composition_coverage(index,s,size),raw
 
     def preview(self,index,mode):
-        if mode=='reference':
-            return self.ref_small
-        if mode=='video':
-            return read_image(self.path/'frames'/f'{index:05d}.png')
-        merged,warped,alpha,raw=self.compose(index)
-        if mode=='aligned': return warped
-        if mode=='mask': return cv2.cvtColor((alpha*255).astype(np.uint8),cv2.COLOR_GRAY2BGR)
-        if mode=='overlay':
-            red=np.zeros_like(raw); red[:]=[45,200,255]
-            return (raw*(1-alpha[...,None]*.55)+red*alpha[...,None]*.55).astype(np.uint8)
-        return merged
+        return self.preview_at_size(index,mode,(self.meta['pw'],self.meta['ph']))
 
     def preview_size(self,resolution):
         m=self.meta
@@ -424,22 +504,22 @@ class Project:
 
     def preview_sized(self,index,mode,resolution='half'):
         size=self.preview_size(resolution)
-        if size[0]<=self.meta['pw'] and size[1]<=self.meta['ph']:
-            return cv2.resize(self.preview(index,mode),size,interpolation=cv2.INTER_AREA)
+        return self.preview_at_size(index,mode,size)
+
+    def preview_at_size(self,index,mode,size):
+        # Every preview size uses the export compositor and the original source.
+        # Previously small previews used a separate low-resolution renderer.
         source=self.original_frame(index)
         if mode=='video': return cv2.resize(source,size,interpolation=cv2.INTER_LANCZOS4)
         snapshot=self.snapshot()
         if mode in ('mask','overlay'):
-            alpha,face,matrix=self.restoration_masks(index,snapshot)
-            if face is not None:
-                fa=cv2.warpAffine(face,matrix,(self.meta['pw'],self.meta['ph']))
-                alpha=alpha*(1-fa)+fa
-            alpha*=snapshot['settings']['strength'] if snapshot['settings'].get('enabled',True) else 0
-            alpha=cv2.resize(alpha,size,interpolation=cv2.INTER_LINEAR)
-            if mode=='mask':return cv2.cvtColor((alpha*255).clip(0,255).astype(np.uint8),cv2.COLOR_GRAY2BGR)
-            raw=cv2.resize(source,size,interpolation=cv2.INTER_LANCZOS4)
-            return (raw*(1-alpha[...,None]*.55)+np.array([45,200,255],dtype=np.float32)*alpha[...,None]*.55).clip(0,255).astype(np.uint8)
+            alpha=self.composition_coverage(index,snapshot,size)
+            # Keep every nonzero replacement pixel visible in the 8-bit mask.
+            if mode=='mask':return cv2.cvtColor(np.ceil(alpha*255).clip(0,255).astype(np.uint8),cv2.COLOR_GRAY2BGR)
         reference=cached_reference(self.meta['image'],Path(self.meta['image']).stat().st_mtime_ns)
+        if mode=='overlay':
+            composite=self.compose_target(index,source,snapshot,size,reference)
+            return (composite*(1-alpha[...,None]*.55)+np.array([45,200,255],dtype=np.float32)*alpha[...,None]*.55).clip(0,255).astype(np.uint8)
         return self.compose_target(index,source,snapshot,size,reference,mode=mode)
 
     def export_options(self,values=None):
@@ -448,7 +528,7 @@ class Project:
         if not isinstance(values,dict) or set(values)-set(EXPORT_DEFAULTS): raise ValueError('未知导出设置')
         options.update(values)
         if options['size_mode'] not in ('video','2x','4x','original','custom'): raise ValueError('请选择有效的导出尺寸')
-        if options['upscale'] not in ('lanczos','realesrgan'): raise ValueError('请选择有效的放大方式')
+        if options['upscale'] not in ('lanczos',*MODEL_FILES): raise ValueError('请选择有效的放大方式')
         if options['device'] not in ('auto','cuda','cpu'): raise ValueError('无效运算设备')
         if options['tile'] not in (96,192,256): raise ValueError('无效分块大小')
         if not isinstance(options['denoise'],(int,float)) or not math.isfinite(options['denoise']) or not 0<=options['denoise']<=1:
@@ -463,19 +543,20 @@ class Project:
             raise ValueError('宽高需为2～16384的整数，总像素不超过6000万')
         # H.264 yuv420p requires even dimensions. The UI displays this exact rounding rule.
         options['width']=width+width%2; options['height']=height+height%2
-        if options['upscale']=='realesrgan' and not model_available(): raise ValueError('未找到 Real-ESRGAN 权重')
+        if options['upscale'] in MODEL_FILES and not model_available(options['upscale']):
+            raise ValueError(f"未找到 {MODEL_LABELS[options['upscale']]} 权重")
         return options
 
-    def compose_target(self,index,frame,snapshot,size,native_reference,cancel_event=None,mode='composite'):
+    def compose_target(self,index,frame,snapshot,size,native_reference,cancel_event=None,mode='composite',_lock_paint=True):
         """Render strips directly from the original image, never from the low-resolution preview."""
         width,height=size; m=self.meta; pw,ph=m['pw'],m['ph']
         result=cv2.resize(frame,(width,height),interpolation=cv2.INTER_LANCZOS4)
         if mode=='composite' and not snapshot['settings'].get('enabled',True): return result
-        alpha,face_mask,face_matrix=self.restoration_masks(index,snapshot)
+        alpha,face_mask,face_matrix=self.composition_masks(index,snapshot,size)
         inverse=cv2.invertAffineTransform(np.array(m['matrix'],np.float32))
         face_inverse=cv2.invertAffineTransform(face_matrix) if face_matrix is not None else None
         original_h,original_w=native_reference.shape[:2]
-        flow=self.back[index].astype(np.float32)
+        flow=self.alignment_flow(index,snapshot['settings'])
         x=(np.arange(width,dtype=np.float32)+.5)*pw/width-.5
 
         def source_at(qx,qy):
@@ -488,7 +569,7 @@ class Project:
             bottom=min(height,top+128)
             ys=(np.arange(top,bottom,dtype=np.float32)+.5)*ph/height-.5
             cx,cy=np.meshgrid(x,ys)
-            a=cv2.remap(alpha,cx,cy,cv2.INTER_LINEAR,borderMode=cv2.BORDER_REPLICATE)[...,None]
+            a=alpha[top:bottom,...,None]
             stripe=result[top:bottom].astype(np.float32)
             if mode=='reference':
                 stripe=source_at(cx,cy).astype(np.float32)
@@ -499,18 +580,39 @@ class Project:
             if face_mask is not None and mode!='reference':
                 qx=face_inverse[0,0]*cx+face_inverse[0,1]*cy+face_inverse[0,2]
                 qy=face_inverse[1,0]*cx+face_inverse[1,1]*cy+face_inverse[1,2]
-                fa=cv2.remap(face_mask,qx,qy,cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT)[...,None]
+                fa=face_mask[top:bottom,...,None]
                 if fa.max()>0: stripe=stripe*(1-fa)+source_at(qx,qy)*fa
             opacity=snapshot['settings']['strength'] if mode=='composite' else 1
             result[top:bottom]=np.clip(result[top:bottom]*(1-opacity)+stripe*opacity,0,255).astype(np.uint8)
+        if mode=='composite' and _lock_paint:
+            locked=self.fixed_paint_patch(snapshot,size)
+            if locked is not None:
+                support,patch=locked
+                result[support]=patch[support]
         return result
+
+    def render_export_frame(self,index,frame,options,snapshot,reference,upscaler=None,progress=None,cancel=None):
+        if upscaler:
+            frame=upscaler.enhance(frame,progress,cancel)
+        return self.compose_target(index,frame,snapshot,(options['width'],options['height']),reference,cancel)
+
+    def export_preview(self,index,options,snapshot):
+        upscaler=None
+        try:
+            if options['upscale'] in MODEL_FILES:
+                upscaler=RealESRGAN(options['denoise'],options['device'],options['tile'],model=options['upscale'])
+            reference=cached_reference(self.meta['image'],Path(self.meta['image']).stat().st_mtime_ns)
+            return self.render_export_frame(index,self.original_frame(index),options,snapshot,reference,upscaler)
+        finally:
+            if upscaler: upscaler.close()
 
     def export(self,options=None,snapshot=None):
         options=self.export_options(options)
         snapshot=snapshot or self.snapshot()
         self.export_status=dict(phase='exporting',progress=0,message='开始全分辨率合成')
         width,height=options['width'],options['height']
-        label='-AI4x' if options['upscale']=='realesrgan' else ''
+        label={'realesrgan':'-AI4x','realesrgan-animevideo':'-AnimeVideo4x'}.get(options['upscale'],'')
+        if snapshot['settings'].get('alignment_mode')=='fixed': label+='-Fixed'
         name=f'restored-{time.strftime("%Y%m%d-%H%M%S")}-{width}x{height}{label}.mp4'
         exports=self.path/'exports'; exports.mkdir(exist_ok=True)
         dest=exports/name; temporary=exports/('partial-'+name)
@@ -524,9 +626,9 @@ class Project:
         upscaler=None; started=time.monotonic()
         try:
             native_reference=cached_reference(m['image'],Path(m['image']).stat().st_mtime_ns)
-            if options['upscale']=='realesrgan':
-                self.export_status=dict(phase='exporting',progress=0,message='加载 Real-ESRGAN 4× 去噪超分模型')
-                upscaler=RealESRGAN(options['denoise'],options['device'],options['tile'])
+            if options['upscale'] in MODEL_FILES:
+                self.export_status=dict(phase='exporting',progress=0,message=f"加载 {MODEL_LABELS[options['upscale']]} 4× 超分模型")
+                upscaler=RealESRGAN(options['denoise'],options['device'],options['tile'],model=options['upscale'])
             with (exports/'ffmpeg.log').open('wb') as err:
                 process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=err,
                                          creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -536,12 +638,12 @@ class Project:
                         if i>=m['frames']: break
                         if self.cancel_export.is_set(): raise ExportCancelled()
                         video_frame=frame.to_ndarray(format='bgr24')
+                        progress=None
                         if upscaler:
                             def progress(done,total):
                                 self.export_status=dict(phase='exporting',progress=round(95*(i+done/total)/m['frames']),
-                                  message=f'Real-ESRGAN {upscaler.device}：第{i+1}/{m["frames"]}帧，分块{done}/{total}')
-                            video_frame=upscaler.enhance(video_frame,progress,self.cancel_export)
-                        merged=self.compose_target(i,video_frame,snapshot,(width,height),native_reference,self.cancel_export)
+                                  message=f'{upscaler.name} {upscaler.device}：第{i+1}/{m["frames"]}帧，分块{done}/{total}')
+                        merged=self.render_export_frame(i,video_frame,options,snapshot,native_reference,upscaler,progress,self.cancel_export)
                         process.stdin.write(merged.tobytes())
                         elapsed=time.monotonic()-started
                         self.export_status=dict(phase='exporting',progress=round(95*(i+1)/m['frames']),
@@ -561,7 +663,7 @@ class Project:
             metadata=dict(settings=snapshot['settings'],face_region=snapshot['face_region'],
                           source=m['video'],image=m['image'],frames=m['frames'],fps=m['fps'],
                           export_options=options,native_reference=True,
-                          model='realesr-general-x4v3' if upscaler else None,
+                          model=upscaler.name if upscaler else None,
                           device=upscaler.device if upscaler else 'cpu')
             dest.with_suffix('.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
             self.export_status=dict(phase='done',progress=100,message='导出完成',filename=name,path=str(dest))

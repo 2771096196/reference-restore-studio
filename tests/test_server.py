@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+import numpy as np
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 import server
@@ -33,6 +34,24 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_custom_port_origin(self):
         response=await self.client.post('/api/sample',json={},headers={'Origin':f'http://127.0.0.1:{self.client.port}'})
         self.assertEqual(response.status,404)
+
+    async def test_export_preview_returns_png_without_starting_video_export(self):
+        p=Mock()
+        p.status={'phase':'ready'};p.export_status={'phase':'idle'};p.meta={'frames':3}
+        p.export_options.return_value={'width':8,'height':6,'upscale':'lanczos'}
+        p.snapshot.return_value={'settings':{}}
+        p.export_preview.return_value=np.zeros((6,8,3),np.uint8)
+        server.CURRENT='test';server.PROJECTS['test']=p
+        response=await self.client.post('/api/export-preview',json={'frame':2,'options':{'upscale':'lanczos'}})
+        self.assertEqual(response.status,200)
+        self.assertEqual(response.content_type,'image/png')
+        self.assertTrue((await response.read()).startswith(b'\x89PNG'))
+        self.assertEqual(p.export_status,{'phase':'idle'})
+        response=await self.client.post('/api/export-preview',json={'frame':3,'options':{}})
+        self.assertEqual(response.status,400)
+        p.export_status={'phase':'exporting'}
+        response=await self.client.post('/api/export-preview',json={'frame':0,'options':{}})
+        self.assertEqual(response.status,409)
 
     async def test_foreign_origin_and_host_are_blocked(self):
         response=await self.client.post('/api/sample',json={},headers={'Origin':'https://example.com'})

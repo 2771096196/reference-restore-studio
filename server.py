@@ -5,7 +5,10 @@ import json
 import logging
 import math
 import mimetypes
+import os
 import shutil
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,7 +18,7 @@ import numpy as np
 from aiohttp import web
 
 from engine import Project, DEFAULTS
-from upscaler import model_available
+from upscaler import model_available, model_availability
 from config import DATA, SAMPLE_IMAGE, SAMPLE_VIDEO, SAMPLE_PROJECT, sample_available
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +27,7 @@ PROJECTS = {}
 CURRENT = None
 TASKS = set()
 PREVIEW_LOCK=asyncio.Lock()
+EXPORT_PREVIEW_LOCK=asyncio.Lock()
 PREVIEW_LATEST={}
 
 
@@ -78,7 +82,8 @@ async def state(request):
                                   face_region=p.face_region,revision=p.revision,undo=len(p.undo_stack),
                                   export=p.export_status,export_preferences=p.export_preferences,
                                   sample_available=sample_available(),
-                                  super_resolution={'available':model_available(),'model':'realesr-general-x4v3','scale':4}))
+                                  super_resolution={'available':model_available(),'model':'realesr-general-x4v3','scale':4,
+                                                    'models':model_availability()}))
 
 
 def idle_for_import():
@@ -171,11 +176,20 @@ async def settings(request):
     for key,value in values.items():
         if key in ('enabled','auto','face'):
             if type(value) is not bool: raise ValueError('开关参数格式不正确')
+        elif key=='alignment_mode':
+            if value not in ('fixed','tracked'): raise ValueError('无效对齐模式')
+        elif key=='paint_blend':
+            if value not in ('soft','frozen'): raise ValueError('无效笔触合成模式')
+        elif key=='alignment_frame':
+            if type(value) is not int or not 0<=value<p.meta['frames']: raise ValueError('固定帧超出范围')
         elif key in limits:
             if not isinstance(value,(float,int)) or not math.isfinite(value): raise ValueError('参数必须是有限数字')
             if not limits[key][0]<=value<=limits[key][1]: raise ValueError('参数超出范围')
         else: raise ValueError('未知设置')
         checked[key]=value
+    candidate=dict(p.settings,**checked)
+    if candidate.get('alignment_mode')=='fixed':
+        await asyncio.to_thread(p.fixed_alignment,candidate.get('alignment_frame',0))
     with p.lock:
         p.settings.update(checked); p.save_edits()
     return web.json_response({'revision':p.revision})
@@ -192,12 +206,15 @@ async def stroke(request):
     radius=d['radius']; index=d['frame']; mode=d['mode']; space=d['space']
     hardness=d.get('hardness',.5); opacity=d.get('opacity',1.0)
     flow_rate=d.get('flow',1.0)
+    spacing=d.get('spacing',.1)
+    if type(spacing) not in (int,float) or not math.isfinite(spacing) or not .01<=spacing<=1:
+        raise ValueError('笔尖间距应在1%到100%之间')
     if any(not isinstance(x,(float,int)) or not math.isfinite(x) or not 0<=x<=1 for x in (hardness,opacity,flow_rate)):
         raise ValueError('画笔硬度与不透明度必须在0到1之间')
     if mode not in ('restore','protect','auto') or space not in ('reference','current'): raise ValueError('画笔模式不正确')
     if not isinstance(radius,(float,int)) or not .0001<=radius<=.25: raise ValueError('画笔尺寸不正确')
     if type(index) is not int or not 0<=index<p.meta['frames']: raise ValueError('帧数不正确')
-    await asyncio.to_thread(p.stroke,pts,radius,mode,index,space,hardness,opacity,flow_rate)
+    await asyncio.to_thread(p.stroke,pts,radius,mode,index,space,hardness,opacity,flow_rate,spacing)
     return web.json_response({'revision':p.revision})
 
 
@@ -207,11 +224,8 @@ async def thumbnail(request):
     if mode not in ('reference','video','mask') or not 0<=index<p.meta['frames']: raise ValueError('无效缩略图')
     def render():
         if mode=='mask':
-            alpha,face,matrix=p.restoration_masks(index,p.snapshot())
-            if face is not None:
-                fa=cv2.warpAffine(face,matrix,(p.meta['pw'],p.meta['ph']))
-                alpha=alpha*(1-fa)+fa
-            image=(alpha*255).clip(0,255).astype(np.uint8)
+            alpha=p.composition_coverage(index,p.snapshot(),(p.meta['pw'],p.meta['ph']))
+            image=np.ceil(alpha*255).clip(0,255).astype(np.uint8)
         else:
             image=p.preview(index,mode)
         image=cv2.resize(image,(160,max(1,round(image.shape[0]*160/image.shape[1]))),interpolation=cv2.INTER_AREA)
@@ -254,6 +268,7 @@ async def reset_mask(request):
 @routes.post('/api/export')
 async def export(request):
     p=active()
+    if EXPORT_PREVIEW_LOCK.locked(): raise web.HTTPConflict(text='正在生成导出效果预览，请完成后再导出视频')
     if p.export_status['phase']=='exporting': raise web.HTTPConflict(text='已有导出任务正在进行')
     options=p.export_options(await request.json())
     with p.lock:
@@ -263,6 +278,31 @@ async def export(request):
     p.export_status=dict(phase='exporting',progress=0,message='准备导出')
     launch(p.export,options,snapshot)
     return web.json_response({'started':True})
+
+
+@routes.post('/api/export-preview')
+async def export_preview(request):
+    p=active()
+    if p.export_status['phase']=='exporting' or EXPORT_PREVIEW_LOCK.locked():
+        raise web.HTTPConflict(text='正在导出或生成效果预览，请稍后再试')
+    data=await request.json()
+    index=data.get('frame')
+    if type(index) is not int or not 0<=index<p.meta['frames']: raise ValueError('预览帧超出范围')
+    options=p.export_options(data.get('options'))
+    snapshot=p.snapshot()
+    async with EXPORT_PREVIEW_LOCK:
+        def render():
+            image=p.export_preview(index,options,snapshot)
+            ok,encoded=cv2.imencode('.png',image)
+            if not ok: raise ValueError('导出预览编码失败')
+            return encoded.tobytes()
+        task=asyncio.create_task(asyncio.to_thread(render))
+        try:
+            result=await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+    return web.Response(body=result,content_type='image/png',headers={'Cache-Control':'no-store'})
 
 
 @routes.post('/api/cancel-export')
@@ -277,9 +317,8 @@ async def mask_download(request):
     p=active(); index=int(request.query.get('frame','0'))
     if not 0<=index<p.meta['frames']: raise ValueError('帧数超出范围')
     def render():
-        _,_,alpha,_=p.compose(index)
-        alpha=cv2.resize(alpha,(p.meta['width'],p.meta['height']),interpolation=cv2.INTER_LINEAR)
-        ok,data=cv2.imencode('.png',(alpha*255).astype(np.uint8))
+        alpha=p.composition_coverage(index,p.snapshot(),(p.meta['width'],p.meta['height']))
+        ok,data=cv2.imencode('.png',np.ceil(alpha*255).clip(0,255).astype(np.uint8))
         if not ok: raise ValueError('蒙版编码失败')
         return data.tobytes()
     data=await asyncio.to_thread(render)
@@ -307,6 +346,31 @@ async def export_video(request):
     path=p.path/'exports'/name
     if not path.is_file(): raise web.HTTPNotFound()
     return web.FileResponse(path,headers={'Content-Type':'video/mp4'})
+
+
+@routes.post('/api/open-export-folder')
+async def open_export_folder(request):
+    p=active(False)
+    data=await request.json()
+    if data.get('project')!=CURRENT:
+        raise web.HTTPConflict(text='工程已切换，请刷新后再打开导出目录')
+    name=data.get('filename','')
+    if (not isinstance(name,str) or Path(name).name!=name or '/' in name or '\\' in name
+            or not name.startswith('restored-') or not name.endswith('.mp4')):
+        raise ValueError('无效的导出文件名')
+    directory=(p.path/'exports').resolve()
+    target=(directory/name).resolve()
+    if target.parent!=directory or not target.is_file():
+        raise web.HTTPNotFound(text='成片文件不存在，可能已被移动或删除')
+    def open_folder():
+        if sys.platform=='win32': os.startfile(str(directory))
+        elif sys.platform=='darwin': subprocess.Popen(['open',str(directory)])
+        else: subprocess.Popen(['xdg-open',str(directory)])
+    try:
+        await asyncio.to_thread(open_folder)
+    except OSError as exc:
+        return web.json_response({'error':'无法打开文件夹：'+str(exc)},status=500)
+    return web.json_response({'opened':True,'folder':str(directory)})
 
 
 async def startup(app):

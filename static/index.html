@@ -9,8 +9,9 @@
       type="image/svg+xml"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23202b30'/%3E%3Cpath d='m14 27 18-10 18 10-18 10Z' fill='%23edbb76'/%3E%3Cpath d='m14 38 18 10 18-10' fill='none' stroke='%23edbb76' stroke-width='5'/%3E%3C/svg%3E"
     />
-    <link rel="stylesheet" href="/static/style.css" />
-    <script defer src="/static/app.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v=20260923-brush2" />
+    <script defer src="/static/brush.js?v=20260923-brush"></script>
+    <script defer src="/static/app.js?v=20260923-open-folder"></script>
   </head>
   <body>
     <header class="menubar">
@@ -41,11 +42,11 @@
       <span class="option-tool" id="current-tool-label">画笔 · 擦回原图</span>
       <div class="brush-option">
         <label for="brush-size"
-          >大小 <output id="brush-size-out">48 px</output></label
+          >大小 px <input id="brush-size-out" class="brush-number" type="number" min="1" max="250" value="48" aria-label="画笔直径像素" /></label
         ><input
           id="brush-size"
           type="range"
-          min="6"
+          min="1"
           max="250"
           step="1"
           value="48"
@@ -53,24 +54,25 @@
       </div>
       <div class="brush-option">
         <label for="brush-hardness"
-          >硬度 <output id="brush-hardness-out">50%</output></label
+          >硬度 % <input id="brush-hardness-out" class="brush-number" type="number" min="0" max="100" value="50" aria-label="画笔硬度百分比" /></label
         ><input id="brush-hardness" type="range" min="0" max="100" value="50" />
       </div>
       <span class="option-divider"></span>
       <div class="brush-option">
         <label for="brush-opacity"
-          >不透明度 <output id="brush-opacity-out">100%</output></label
+          >不透明度 % <input id="brush-opacity-out" class="brush-number" type="number" min="0" max="100" value="100" aria-label="画笔不透明度百分比" /></label
         ><input id="brush-opacity" type="range" min="0" max="100" value="100" />
       </div>
       <div class="brush-option">
         <label for="brush-flow"
-          >流量 <output id="brush-flow-out">100%</output></label
+          >流量 % <input id="brush-flow-out" class="brush-number" type="number" min="1" max="100" value="100" aria-label="画笔流量百分比" /></label
         ><input id="brush-flow" type="range" min="1" max="100" value="100" />
       </div>
+      <button class="button" id="brush-settings-button">笔尖设置</button>
       <span
         class="option-hint"
         title="不透明度控制单笔上限；流量控制经过时的累积速度。"
-        >单笔上限 ≠ 累积速度</span
+        >低硬度＝软边 · 低流量可来回叠加</span
       >
     </div>
     <div class="editor">
@@ -151,16 +153,16 @@
         </div>
         <div class="viewer-top">
           <div class="view-tabs" role="group" aria-label="预览模式">
-            <button data-view="composite" class="selected">合成</button
-            ><button data-view="video">视频</button
-            ><button data-view="aligned">对齐原图</button
-            ><button data-view="mask">蒙版</button
-            ><button data-view="overlay">覆盖区域</button
-            ><button data-view="reference">原图画布</button>
+            <button data-view="composite" class="selected" title="查看回贴后的合成效果；画布不含AI超分">效果预览</button
+            ><button data-view="video" title="未回贴、未超分的原视频，用于前后对比">原视频</button
+            ><button data-view="aligned" title="只看对齐后的原图，不与视频混合">对齐原图</button
+            ><button data-view="mask" title="白色使用回贴或锁定结果，黑色保留当前视频；与实际合成共用范围">黑白蒙版</button
+            ><button data-view="overlay" title="在效果预览上标出实际替换范围，与黑白蒙版对齐；黄色不导出">回贴范围</button
+            ><button data-view="reference" title="在固定的原图坐标上画蒙版或框选脸部，不是成片">原图画布</button>
           </div>
           <div class="preview-controls">
             <label
-              >预览
+              >画布清晰度
               <select id="preview-resolution" aria-label="预览分辨率">
                 <option value="eighth">1/8 · 最流畅</option>
                 <option value="quarter">1/4 · 流畅</option>
@@ -171,6 +173,10 @@
               </select></label
             ><span id="preview-label"></span>
           </div>
+        </div>
+        <div class="view-explanation" role="status" aria-live="polite">
+          <div><strong id="view-name">效果预览 · 不含AI超分</strong><span id="view-description">回贴后的合成画面。查看最终清晰度，请在导出窗口使用“预览当前帧”。</span></div>
+          <button class="button" id="return-composite" hidden>返回效果预览</button>
         </div>
         <div id="viewport">
           <div id="surface">
@@ -183,7 +189,7 @@
             <div id="empty-stage">
               <span>▱</span>
               <h1>擦回原图的细节</h1>
-              <p>原图与视频自动对齐后，用黑白蒙版决定保留哪里。</p>
+              <p>先导入原图与视频，涂抹回贴范围，再切到“效果预览”查看。</p>
               <button class="button primary" id="empty-import">
                 导入原图与视频
               </button>
@@ -291,6 +297,27 @@
           </div>
         </section>
         <section class="properties-panel">
+          <div class="panel-title"><strong>对齐方式</strong><span>原图回贴</span></div>
+          <div class="property-body">
+            <label class="export-field">贴图位置
+              <select id="alignment-mode">
+                <option value="fixed">固定对齐 · 后续帧不再跟踪</option>
+                <option value="tracked">逐帧跟踪 · 随视频运动</option>
+              </select>
+            </label>
+            <div id="alignment-fixed-controls">
+              <label class="export-field">笔触边缘
+                <select id="paint-blend">
+                  <option value="soft">PS式柔边混合 · 保留灰度</option>
+                  <option value="frozen">整块锁色 · 所有涂到的像素固定</option>
+                </select>
+              </label>
+              <p id="alignment-frame-label" class="small muted">固定到第 1 帧</p>
+              <button class="button full" id="alignment-lock-current">对齐并固定到当前帧</button>
+              <button class="button full" id="alignment-lock-first" style="margin-top:6px">固定到第 1 帧</button>
+            </div>
+            <p id="alignment-note" class="small muted">涂抹区域锁定为对齐帧的合成颜色，包括软边和半透明笔触，后续帧直接复用。未涂抹区域继续播放。</p>
+          </div>
           <div class="panel-title">
             <strong>蒙版属性</strong><span>自动 + 手绘</span>
           </div>
@@ -363,7 +390,7 @@
                 value="100"
               />
               <p class="small muted">
-                整张脸来自原图，表情固定。跟随头部移动，不对五官做光流拉伸。
+                整张脸来自原图，表情固定。“固定对齐”时位置不变；“逐帧跟踪”时跟随头部移动。
               </p>
             </div>
           </details>
@@ -399,6 +426,7 @@
               <p id="export-path"></p>
             </div>
             <button id="preview-export" class="button">播放成片</button
+            ><button id="open-export-folder" class="button" title="在系统文件管理器中打开成片所在目录">打开文件夹</button
             ><a id="download-video" class="button primary" download
               >下载 MP4 ↓</a
             >
@@ -409,6 +437,22 @@
         </div>
       </aside>
     </div>
+    <dialog id="brush-settings-dialog">
+      <div class="dialog-head"><h2>圆形画笔 · 软边与叠加</h2><button data-close="brush-settings-dialog">×</button></div>
+      <div class="brush-presets"><button class="button" data-brush-hardness="0">柔边圆 · 0%</button><button class="button" data-brush-hardness="50">中等 · 50%</button><button class="button" data-brush-hardness="100">硬边圆 · 100%</button></div>
+      <div class="brush-demo-controls">
+        <label>硬度 %<input id="brush-demo-hardness" type="number" min="0" max="100" value="50" /></label>
+        <label>不透明度 %<input id="brush-demo-opacity" type="number" min="0" max="100" value="100" /></label>
+        <label>流量 %<input id="brush-demo-flow" type="number" min="1" max="100" value="100" /></label>
+      </div>
+      <p class="small muted">笔尖示例：上方单次划过；下方不松开鼠标来回擦3遍。示例直径48px，使用当前硬度、不透明度和流量。</p>
+      <canvas id="brush-tip-preview" width="400" height="150" aria-label="相同不透明度下单次划过与同一笔反复涂抹的对比"></canvas>
+      <label class="range-label" for="brush-spacing">笔尖间距 <output id="brush-spacing-out">10%</output></label>
+      <input id="brush-spacing" type="range" min="1" max="100" value="10" />
+      <p class="small muted">间距按直径计算，越小越连续。不透明度控制单笔上限；低流量在同一笔内来回擦会叠加，松开再画可继续叠加。</p>
+      <p class="small muted">硬度0%为软边，100%为硬边。调整只影响之后的笔触；已画好的笔触可撤销后重画。</p>
+      <p class="small muted">全白蒙版上继续涂白不会再变白，全黑处继续涂黑也不会再改变。用相反颜色涂抹，才能看出不透明度和流量的差别。</p>
+    </dialog>
     <dialog id="import-dialog">
       <form id="import-form">
         <div class="dialog-head">
@@ -445,6 +489,10 @@
         <button data-close="help-dialog">×</button>
       </div>
       <ol class="help-steps">
+        <li><strong>先分清“效果”和“辅助视图”</strong>
+          <p>效果预览：回贴后的画面，画布不含AI超分。原视频：未修改的底片，用于对比。对齐原图：只看原图摆放的位置。黑白蒙版：白色使用回贴或锁定结果、黑色保留当前视频。回贴范围：在效果预览上按同一蒙版叠加黄色标记，位置和范围一致，黄色不导出。原图画布：在固定坐标上编辑蒙版。</p>
+          <p>想确认导出清晰度：点击“导出 MP4”，设置尺寸与模型，再点“预览当前帧 · 含所选超分”。这会生成一张与导出使用相同处理流程的图片。</p>
+        </li>
         <li>
           <strong>导入、等待自动对齐</strong>
           <p>
@@ -515,10 +563,12 @@
         <label class="export-field"
           >视频放大方式<select id="export-upscale">
             <option value="lanczos">快速缩放 · Lanczos（非模型超分）</option>
-            <option value="realesrgan">AI 去噪 + 4× 超分 · Real-ESRGAN</option>
+            <option value="realesrgan">通用图片模型 · Real-ESRGAN（可调去噪）</option>
+            <option value="realesrgan-animevideo">动漫视频模型 · Real-ESRGAN AnimeVideo v3</option>
           </select></label
         >
         <div id="ai-options" hidden>
+          <div id="denoise-options">
           <label class="range-label" for="export-denoise"
             >去噪强度 <output id="export-denoise-out">50%</output></label
           ><input
@@ -532,6 +582,7 @@
           <p class="small muted">
             低：更多纹理与颗粒。高：更干净，也可能抹掉纹理。模型先做4×，再适配最终尺寸；不改变高清原图回贴内容。
           </p>
+          </div>
           <div class="export-row">
             <label class="export-field"
               >运算设备<select id="export-device">
@@ -547,13 +598,15 @@
               </select></label
             >
           </div>
-          <div class="tip">
+          <div class="tip" id="export-model-note">
             开源模型：realesr-general-x4v3，使用官方强/弱去噪权重混合。逐帧处理，不是多帧时域去噪；原视频的闪烁仍可能保留。
           </div>
         </div>
         <div id="large-export-warning" class="tip amber" hidden>
           超大尺寸导出会明显增加时间、内存和文件大小。超过8K的MP4在部分浏览器/硬件播放器中可能无法播放，可以用本地软件播放器查看。
         </div>
+        <button type="button" class="button full" id="preview-export-frame" style="margin-top:20px">预览当前帧 · 含所选超分</button>
+        <p class="small muted">按当前导出尺寸和模型生成一张预览图，不导出整段视频。查看后可返回调整参数。</p>
         <button
           type="submit"
           class="button primary full"
@@ -563,6 +616,13 @@
           开始导出
         </button>
       </form>
+    </dialog>
+    <dialog id="export-preview-dialog">
+      <div class="dialog-head"><h2>导出效果预览 · 当前帧</h2><button data-close="export-preview-dialog">×</button></div>
+      <p id="export-preview-status" role="status">正在生成…</p>
+      <p class="small muted">使用导出相同的尺寸、超分模型和回贴流程；不含黄色辅助遮罩。显示的是此次设置的静态快照，MP4压缩后可能有轻微差异。</p>
+      <img id="export-preview-image" alt="当前帧的导出合成效果" hidden />
+      <a class="button" id="export-preview-download" download="export-preview.png" hidden>下载原尺寸 PNG</a>
     </dialog>
     <dialog id="video-dialog">
       <div class="dialog-head">
