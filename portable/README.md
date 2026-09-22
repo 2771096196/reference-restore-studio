@@ -4,6 +4,8 @@
 
 ## 使用
 
+推荐在 [GitHub 下载页](https://github.com/2771096196/reference-restore-studio/releases/tag/v0.2.0-portable-preview) 获取 **H3-Portable-Downloader.exe**。运行后选择位置，点击“下载并解压”，下载器会自动获取两个分卷、校验、合并并解压。它只写入所选目录，不修改系统环境；请预留约12 GiB空间用于下载缓存与程序。若手动下载分卷，可放到所选位置下的 `H3-Portable-downloads` 文件夹，下载器会校验并复用。不要单独解压 `.001` 或 `.002`。
+
 1. 完整解压程序包到可写目录，双击 `H3便携启动器.exe`。不要从压缩包内部运行，也不要单独移动 EXE。
 2. 已有 `models` 文件夹时，点击“选择已有模型目录”，选择包含 `diffusion_models`、`text_encoders`、`vae` 等子目录的根目录。可以使用别的盘符，默认使用程序旁的 `models`。
 3. 下载了散装权重时，点击“导入已下载权重”，或放到程序旁的 `inbox`。完成文件会按大小和 SHA-256 校验后自动复制到正确位置，原文件保留。同名不同版本不会覆盖已有模型。
