@@ -89,6 +89,8 @@ def main():
         shutil.copy2(source/'ComfyUI/user/default/workflows'/name,root/'ComfyUI/user/default/workflows'/name)
         workflow=root/'ComfyUI/user/default/workflows'/name
         workflow.write_text(re.sub(r'[A-Za-z]:/[^"\n]*?/ComfyUI/output/video','ComfyUI/output/video',workflow.read_text(encoding='utf-8')),encoding='utf-8')
+    for workflow in (repo/'portable/workflows').glob('*.json'):
+        shutil.copy2(workflow,root/'ComfyUI/user/default/workflows'/workflow.name)
     # Shared models are configured at launch, relative to the selected directory.
     (root/'retouch-studio/config.local.json').write_text(json.dumps({'data_dir':'../retouch-data','weights_dir':'../models/upscale_models'}),encoding='utf-8')
     ffmpeg_zip=cache/'ffmpeg-release-essentials.zip'

@@ -14,6 +14,12 @@
 
 H3 入门流程在 ComfyUI 的工作流列表中，采用已经在 RTX 3060 12GB / 32GB RAM 上验证的 512×288、56帧、4步配置。所需权重以管理页的“H3 入门工作流”分组为准。
 
+### Krea2 图片生成
+
+[Krea2 Muse 修正版工作流](workflows/Krea2-Muse-Fixed.json)可保存为 JSON 后拖入 ComfyUI。它沿用 `Krea2/Krea2-MuseByStable_v30Turbo_fp8.safetensors`，文本编码器必须选择 `qwen3vl_4b_fp8_scaled.safetensors`，CLIPLoader 的 `type` 必须为 `krea2`，VAE 必须为 `qwen_image_vae.safetensors`。不能将 H3 的32B编码器或音频VAE混入这个图片工作流。遇到“expects 30720 features but got 5120”时，请同时检查编码器文件和类型。
+
+该修正版已用同款主模型完成128×128、8步实际出图；保留原流程的采样和shift设置。导入后换成自己的提示词，确认能运行后再逐步提高分辨率。早期便携包用户只需单独导入此JSON，不必重新下载运行环境。模型缺失时，编码器放在 `models/text_encoders`，图像VAE放在 `models/vae`。
+
 ## 环境与限制
 
 - 面向 Windows 10/11 x64。软件不依赖系统 Python、pip、Git 或 CUDA Toolkit；GPU 仍需要兼容 CUDA 13 的 NVIDIA 驱动，缺少 GPU 时原图回贴可选择 CPU。
